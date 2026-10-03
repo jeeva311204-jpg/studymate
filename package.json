@@ -1,0 +1,22 @@
+{
+  "name": "studymate",
+  "version": "1.0.0",
+  "description": "StudyMate — Full-Stack AI Study Companion for Students",
+  "scripts": {
+    "server": "npm --prefix server run dev",
+    "client": "npm --prefix client run dev",
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "build:client": "npm --prefix client run build"
+  },
+  "keywords": [
+    "ai",
+    "study-companion",
+    "gemini",
+    "education",
+    "quiz",
+    "flashcards",
+    "study-planner"
+  ],
+  "author": "StudyMate Team",
+  "license": "MIT"
+}
