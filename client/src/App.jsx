@@ -12,6 +12,7 @@ import QuizPage from './pages/QuizPage';
 import FlashcardsPage from './pages/FlashcardsPage';
 import PlannerPage from './pages/PlannerPage';
 import QuestionsPage from './pages/QuestionsPage';
+import AskPage from './pages/AskPage';
 
 function App() {
   return (
@@ -32,6 +33,14 @@ function App() {
                   element={
                     <ProtectedRoute>
                       <DashboardPage />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/ask"
+                  element={
+                    <ProtectedRoute>
+                      <AskPage />
                     </ProtectedRoute>
                   }
                 />

@@ -14,6 +14,9 @@ const { getJwtSecret } = require('../config/jwt');
 const User = require('../models/User');
 const Note = require('../models/Note');
 const QuizResult = require('../models/QuizResult');
+const AskUsage = require('../models/AskUsage');
+const geminiConfig = require('../config/gemini');
+const { getKolkataDateString } = require('../controllers/askController');
 
 process.env.PORT = '5001';
 
@@ -55,7 +58,7 @@ if (targetDatabaseName !== 'studymate_test') {
 
 const app = require('../index');
 
-describe('StudyMate Backend Test Suite (Items 1 to 3)', () => {
+describe('StudyMate API', () => {
   let server;
   let user1;
   let user2;
@@ -566,6 +569,271 @@ describe('StudyMate Backend Test Suite (Items 1 to 3)', () => {
         .set('Authorization', authUser1);
       assert.equal(res.status, 404);
       assert.deepEqual(res.body, { error: true, message: 'Route not found' });
+    });
+  });
+
+  // ==========================================
+  // 5. Ask AI (POST /api/ask)
+  // ==========================================
+  describe('5. Ask AI (POST /api/ask)', () => {
+    it('5.1 returns 401 without authorization token', async () => {
+      const res = await request(server)
+        .post('/api/ask')
+        .send({ question: 'What is scheduling in OS?', mode: 'doubt' });
+      assert.equal(res.status, 401);
+    });
+
+    it('5.2 returns 400 for non-string question', async () => {
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({ question: 12345, mode: 'doubt' });
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /string/i);
+    });
+
+    it('5.3 returns 400 for question too short (< 3 characters)', async () => {
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({ question: 'hi', mode: 'doubt' });
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /between 3 and 2000/i);
+    });
+
+    it('5.4 returns 400 for question too long (> 2000 characters)', async () => {
+      const longQuestion = 'a'.repeat(2001);
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({ question: longQuestion, mode: 'doubt' });
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /between 3 and 2000/i);
+    });
+
+    it('5.5 returns 400 for unknown/invalid mode', async () => {
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({ question: 'Explain virtual memory', mode: 'invalid_mode_xyz' });
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /Invalid mode/i);
+    });
+
+    it('5.6 returns 400 for invalid noteId format', async () => {
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({ question: 'Explain paging', mode: 'mark2', noteId: 'not-a-valid-objectid' });
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /Invalid noteId format/i);
+    });
+
+    it('5.7 returns 404 for noteId belonging to another user', async () => {
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({
+          question: 'What is ACID in DBMS?',
+          mode: 'mark2',
+          noteId: user2Note._id.toString(),
+        });
+      assert.equal(res.status, 404);
+      assert.match(res.body.message, /not found or does not belong to you/i);
+    });
+
+    it('5.8 returns 503 when GEMINI_API_KEY is missing (mock helper)', async () => {
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => null);
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({ question: 'What is process synchronization?', mode: 'doubt' });
+        assert.equal(res.status, 503);
+        assert.match(res.body.message, /GEMINI_API_KEY is not configured/i);
+      } finally {
+        mockGetClient.mock.restore();
+      }
+    });
+
+    it('5.9 returns 429 when user has reached daily cap of 40 asks (Asia/Kolkata date)', async () => {
+      const today = getKolkataDateString();
+      // Seed user1's AskUsage to 40 for today
+      await AskUsage.findOneAndUpdate(
+        { user: user1._id, date: today },
+        { count: 40 },
+        { upsert: true, new: true }
+      );
+
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({ question: 'What is thrashing in OS?', mode: 'mark2' });
+
+      assert.equal(res.status, 429);
+      assert.match(res.body.message, /Daily ask limit reached/i);
+
+      // Clean up for subsequent tests
+      await AskUsage.deleteOne({ user: user1._id, date: today });
+    });
+
+    it('5.10 returns 200 with answer, mode, and truncated when successful with user note', async () => {
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => 'A process is an instance of a program execution in memory with code, data, and PCB.'
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({
+            question: 'What is a process based on my notes?',
+            mode: 'mark2',
+            noteId: user1Note._id.toString(),
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.mode, 'mark2');
+        assert.equal(typeof res.body.answer, 'string');
+        assert.ok(res.body.answer.length > 0);
+        assert.equal(res.body.truncated, false);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('5.11 resolves auto mode from model tag "[MODE: mark8]" correctly', async () => {
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => '[MODE: mark8]\n### Overview\nHere is an 8-mark structured answer with points.'
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({
+            question: 'Give me a detailed answer about scheduling algorithms.',
+            mode: 'auto',
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.mode, 'mark8');
+        assert.ok(!res.body.answer.startsWith('[MODE:'));
+        assert.match(res.body.answer, /### Overview/);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('5.12 atomically restricts parallel requests when 38 asks are already used (at most 2 may pass)', async () => {
+      const today = getKolkataDateString();
+      await AskUsage.findOneAndUpdate(
+        { user: user1._id, date: today },
+        { count: 38 },
+        { upsert: true, new: true }
+      );
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => 'Atomic concurrency answer.'
+      );
+
+      try {
+        // Send 5 parallel requests
+        const requests = Array.from({ length: 5 }, (_, i) =>
+          request(server)
+            .post('/api/ask')
+            .set('Authorization', authUser1)
+            .send({ question: `Concurrent test question ${i + 1}`, mode: 'mark2' })
+        );
+
+        const responses = await Promise.all(requests);
+        const passedResponses = responses.filter((r) => r.status === 200);
+        const rateLimitedResponses = responses.filter((r) => r.status === 429);
+
+        // Requirement: at most 2 may pass
+        assert.ok(passedResponses.length <= 2, `Expected at most 2 to pass, got ${passedResponses.length}`);
+        assert.equal(passedResponses.length, 2, 'Exactly 2 slots remained from 38 to 40');
+        assert.equal(rateLimitedResponses.length, 3, 'Remaining 3 requests must be 429 rate limited');
+
+        const finalUsage = await AskUsage.findOne({ user: user1._id, date: today });
+        assert.equal(finalUsage.count, 40);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+        await AskUsage.deleteOne({ user: user1._id, date: today });
+      }
+    });
+
+    it('5.13 decrements reserved slot when Gemini fails so student quota is preserved', async () => {
+      const today = getKolkataDateString();
+      await AskUsage.findOneAndUpdate(
+        { user: user1._id, date: today },
+        { count: 15 },
+        { upsert: true, new: true }
+      );
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => {
+          throw new Error('Gemini upstream network error');
+        }
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({ question: 'Explain TCP handshake', mode: 'doubt' });
+
+        assert.equal(res.status, 503);
+        const usage = await AskUsage.findOne({ user: user1._id, date: today });
+        assert.equal(usage.count, 15, 'Reserved slot must be rolled back on failure');
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+        await AskUsage.deleteOne({ user: user1._id, date: today });
+      }
+    });
+
+    it('5.14 guarantees answer returned in auto mode never contains "[MODE:"', async () => {
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => '[MODE: simple]\nThis is a beginner-friendly explanation of stacks and queues.'
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({
+            question: 'Explain stacks simply',
+            mode: 'auto',
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.mode, 'simple');
+        assert.equal(res.body.answer.includes('[MODE:'), false, 'Answer must never contain "[MODE:"');
+        assert.doesNotMatch(res.body.answer, /\[MODE:/i);
+        assert.match(res.body.answer, /beginner-friendly explanation/);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
     });
   });
 });

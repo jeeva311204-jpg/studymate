@@ -14,6 +14,7 @@ import {
   Menu,
   X,
   GraduationCap,
+  Bot,
 } from 'lucide-react';
 
 const Navbar = () => {
@@ -29,6 +30,7 @@ const Navbar = () => {
 
   const navLinks = [
     { name: 'Dashboard', path: '/', icon: LayoutDashboard },
+    { name: 'Ask AI', path: '/ask', icon: Bot },
     { name: 'Notes & Summary', path: '/notes', icon: BookOpen },
     { name: 'Exam Questions', path: '/questions', icon: GraduationCap },
     { name: 'Quiz Arena', path: '/quiz', icon: HelpCircle },

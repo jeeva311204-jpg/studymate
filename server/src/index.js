@@ -16,6 +16,7 @@ const flashcardRoutes = require('./routes/flashcardRoutes');
 const plannerRoutes = require('./routes/plannerRoutes');
 const dashboardRoutes = require('./routes/dashboardRoutes');
 const questionRoutes = require('./routes/questionRoutes');
+const askRoutes = require('./routes/askRoutes');
 
 const helmet = require('helmet');
 
@@ -96,6 +97,7 @@ app.use('/api/flashcards', flashcardRoutes);
 app.use('/api/planner', plannerRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/questions', questionRoutes);
+app.use('/api/ask', askRoutes);
 
 // JSON 404 handler for unknown /api routes
 app.use('/api', (req, res) => {

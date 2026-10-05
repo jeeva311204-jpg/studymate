@@ -25,6 +25,7 @@ const DashboardPage = () => {
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
   const [quickTopic, setQuickTopic] = useState('');
+  const [askQuestionText, setAskQuestionText] = useState('');
 
   useEffect(() => {
     const fetchStats = async () => {
@@ -191,44 +192,50 @@ const DashboardPage = () => {
             Your notes, quiz performance, interactive flashcards, and exam plans are ready. What would you like to focus on today?
           </p>
 
-          {/* Gemini Deep Topic Search Bar */}
+          {/* Ask AI Search Box */}
           <form
             onSubmit={(e) => {
               e.preventDefault();
-              if (quickTopic.trim()) {
-                navigate(`/questions?topic=${encodeURIComponent(quickTopic.trim())}`);
+              if (askQuestionText.trim()) {
+                navigate(`/ask?q=${encodeURIComponent(askQuestionText.trim())}`);
               }
             }}
-            className="mt-5 max-w-xl"
+            className="mt-6 max-w-xl"
           >
             <div className="relative flex items-center">
               <input
                 type="text"
-                value={quickTopic}
-                onChange={(e) => setQuickTopic(e.target.value)}
-                placeholder="Search any topic (e.g. Java, DBMS, OS) for Gemini notes & likely exam Qs..."
-                className="w-full pl-10 pr-28 py-3 bg-white/15 hover:bg-white/20 focus:bg-white/25 backdrop-blur-md border border-white/25 rounded-2xl text-white placeholder-blue-100 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-white/50 shadow-inner transition-all"
+                value={askQuestionText}
+                onChange={(e) => setAskQuestionText(e.target.value)}
+                placeholder="Ask AI anything (e.g. 'Explain virtual memory' or 'ACID properties in DBMS')..."
+                className="w-full pl-10 pr-28 py-3.5 bg-white/20 hover:bg-white/25 focus:bg-white/30 backdrop-blur-md border border-white/30 rounded-2xl text-white placeholder-blue-100 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-white/60 shadow-lg transition-all"
               />
-              <Search className="w-4 h-4 text-blue-200 absolute left-3.5" />
+              <Sparkles className="w-4 h-4 text-amber-300 absolute left-3.5" />
               <button
                 type="submit"
-                disabled={!quickTopic.trim()}
-                className="absolute right-1.5 px-3.5 py-1.5 rounded-xl bg-white text-brand-700 font-bold text-xs shadow-md hover:bg-slate-100 transition-all disabled:opacity-50"
+                disabled={!askQuestionText.trim()}
+                className="absolute right-1.5 px-4 py-2 rounded-xl bg-white text-brand-700 font-bold text-xs shadow-md hover:bg-slate-100 transition-all disabled:opacity-50 flex items-center space-x-1"
               >
-                Analyze AI
+                <span>Ask AI</span>
+                <ArrowRight className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-blue-100">
-              <span className="font-semibold text-amber-200">Popular:</span>
-              {['Java', 'DBMS', 'Operating Systems', 'Networks'].map((t) => (
+            <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px] text-blue-100">
+              <span className="font-semibold text-amber-200">Try Asking:</span>
+              {[
+                'What is deadlock in OS?',
+                'Explain normalization in DBMS',
+                '2 marks: Define polymorphism',
+                'Short notes on TCP vs UDP',
+              ].map((q) => (
                 <button
-                  key={t}
+                  key={q}
                   type="button"
-                  onClick={() => navigate(`/questions?topic=${encodeURIComponent(t)}`)}
-                  className="px-2 py-0.5 rounded-md bg-white/10 hover:bg-white/20 border border-white/10 transition-colors"
+                  onClick={() => navigate(`/ask?q=${encodeURIComponent(q)}`)}
+                  className="px-2 py-0.5 rounded-md bg-white/10 hover:bg-white/20 border border-white/10 transition-colors text-left"
                 >
-                  {t}
+                  {q}
                 </button>
               ))}
             </div>
@@ -236,6 +243,13 @@ const DashboardPage = () => {
 
           {/* Quick Action Shortcuts */}
           <div className="mt-5 flex flex-wrap gap-2.5">
+            <Link
+              to="/ask"
+              className="inline-flex items-center space-x-2 px-4 py-2 rounded-xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs shadow-md backdrop-blur-md transition-all hover:scale-[1.02]"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+              <span>Ask AI Assistant</span>
+            </Link>
             <Link
               to="/questions"
               className="inline-flex items-center space-x-2 px-4 py-2 rounded-xl bg-amber-400 text-amber-950 font-bold text-xs shadow-md hover:bg-amber-300 transition-all hover:scale-[1.02]"

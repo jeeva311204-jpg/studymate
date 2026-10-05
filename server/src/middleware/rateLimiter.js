@@ -49,8 +49,28 @@ const registerRateLimiter = rateLimit({
   },
 });
 
+/**
+ * Ask AI rate limiter: 30 requests per 15 minutes per user (falls back to IP)
+ * Runs AFTER auth middleware so req.user is populated.
+ */
+const askRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { keyGeneratorIpFallback: false },
+  keyGenerator: (req) => {
+    return req.user?._id ? req.user._id.toString() : req.ip;
+  },
+  message: {
+    error: true,
+    message: 'Too many ask requests. Rate limit is 30 requests per 15 minutes. Please try again later.',
+  },
+});
+
 module.exports = {
   authRateLimiter,
   registerRateLimiter,
   aiRateLimiter,
+  askRateLimiter,
 };
