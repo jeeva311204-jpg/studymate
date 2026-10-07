@@ -12,6 +12,9 @@ router.use(authMiddleware);
 // POST /api/ask (auth required, askRateLimiter applied, multipart image upload + JSON)
 router.post('/', askRateLimiter, askImageUpload, askController.askQuestion);
 
+// GET /api/ask/capabilities (auth required, returns { imageGeneration: boolean })
+router.get('/capabilities', askController.getCapabilities);
+
 // Conversation management routes
 router.get('/conversations', askController.getConversations);
 router.get('/conversations/:id', validateObjectId, askController.getConversationById);

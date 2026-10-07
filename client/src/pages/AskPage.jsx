@@ -160,10 +160,35 @@ const AskPage = () => {
   const [copiedId, setCopiedId] = useState(null);
   const [savingNoteId, setSavingNoteId] = useState(null);
   const [savedNoteMap, setSavedNoteMap] = useState({});
+  const [capabilities, setCapabilities] = useState({ imageGeneration: false });
 
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
   const messagesEndRef = useRef(null);
+
+  // Fetch AI capabilities (checks if image generation is supported/configured)
+  useEffect(() => {
+    const fetchCapabilities = async () => {
+      try {
+        const res = await api.get('/ask/capabilities');
+        if (res.data) {
+          setCapabilities(res.data);
+        }
+      } catch (err) {
+        console.error('Failed to load capabilities:', err);
+      }
+    };
+    fetchCapabilities();
+  }, []);
+
+  const handleModeChange = (newMode) => {
+    setSelectedMode(newMode);
+    if (newMode === 'image' && !capabilities.imageGeneration) {
+      setError("Image generation isn't enabled on this site yet. Try Diagram (SVG) for downloadable diagrams.");
+    } else if (error === "Image generation isn't enabled on this site yet. Try Diagram (SVG) for downloadable diagrams.") {
+      setError('');
+    }
+  };
 
   // Fetch all conversations
   const fetchConversations = async () => {
@@ -329,11 +354,21 @@ const AskPage = () => {
       }
     }
 
+    // Capabilities check: block image generation request if disabled
+    if (selectedMode === 'image' && !capabilities.imageGeneration) {
+      setError("Image generation isn't enabled on this site yet. Try Diagram (SVG) for downloadable diagrams.");
+      return;
+    }
+
     setLoading(true);
     setError('');
 
     try {
       let res;
+      const requestConfig = {};
+      if (selectedMode === 'image') {
+        requestConfig.timeout = 90000; // 90 seconds timeout for image generation only
+      }
 
       if (attachedImage) {
         // Multipart form-data for image attachment
@@ -354,6 +389,7 @@ const AskPage = () => {
           headers: {
             'Content-Type': 'multipart/form-data',
           },
+          ...requestConfig,
         });
       } else {
         // JSON payload for text-only question
@@ -370,10 +406,10 @@ const AskPage = () => {
           payload.conversationId = activeConversationId;
         }
 
-        res = await api.post('/ask', payload);
+        res = await api.post('/ask', payload, requestConfig);
       }
 
-      const { answer, svg, description, image, caption, mode, truncated, conversationId } = res.data;
+      const { answer, svg, description, image, caption, mode, resolvedMode, truncated, conversationId } = res.data;
 
       // Update active conversation ID if newly created
       const effectiveQuestion = trimmed || DEFAULT_IMAGE_QUESTION;
@@ -381,6 +417,8 @@ const AskPage = () => {
         setActiveConversationId(conversationId);
         setActiveTitle(effectiveQuestion.slice(0, 60));
       }
+
+      const actualResolvedMode = resolvedMode || mode || selectedMode;
 
       const newUserMsg = {
         role: 'user',
@@ -394,14 +432,16 @@ const AskPage = () => {
       const newAiMsg = {
         role: 'assistant',
         content: answer || caption || svg || '',
-        svg: svg || (mode === 'svg' ? answer : null),
+        svg: svg || (actualResolvedMode === 'svg' ? answer : null),
         image: image || null,
         caption: caption || '',
         description: description || '',
-        mode: mode || selectedMode,
+        mode: actualResolvedMode,
+        chosenMode: selectedMode,
+        resolvedMode: actualResolvedMode,
         truncated: Boolean(truncated),
         hasImage: false,
-        generatedImage: Boolean(image) || (mode === 'image'),
+        generatedImage: Boolean(image) || (actualResolvedMode === 'image'),
         createdAt: new Date(),
       };
 
@@ -413,11 +453,11 @@ const AskPage = () => {
       fetchConversations();
     } catch (err) {
       console.error('Ask AI error:', err);
-      const msg =
+      const rawMsg =
         err.response?.data?.message ||
         err.message ||
         'Failed to get answer from AI. Please try again.';
-      setError(msg);
+      setError(typeof rawMsg === 'string' ? rawMsg : JSON.stringify(rawMsg));
     } finally {
       setLoading(false);
     }
@@ -518,7 +558,7 @@ const AskPage = () => {
     URL.revokeObjectURL(url);
   };
 
-  const handleDownloadGeneratedImage = (imageObj) => {
+  const handleDownloadGeneratedImage = (imageObj, promptText) => {
     if (!imageObj || !imageObj.data) return;
     const mimeType = imageObj.mimeType || 'image/png';
     const byteCharacters = atob(imageObj.data);
@@ -529,10 +569,17 @@ const AskPage = () => {
     const byteArray = new Uint8Array(byteNumbers);
     const blob = new Blob([byteArray], { type: mimeType });
     const ext = mimeType === 'image/jpeg' ? 'jpg' : mimeType === 'image/webp' ? 'webp' : 'png';
+    const cleanPrompt =
+      (promptText || 'illustration')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 40) || 'illustration';
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `illustration.${ext}`;
+    a.download = `${cleanPrompt}.${ext}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -797,14 +844,17 @@ const AskPage = () => {
               messages.map((item, index) => {
                 const isUser = item.role === 'user';
                 const msgId = item._id || index.toString();
-                const modeDef = MODES.find((m) => m.id === item.mode) || MODES[0];
+                const prevUserMsg = !isUser && index > 0 && messages[index - 1].role === 'user' ? messages[index - 1] : null;
+                const chosenMode = item.chosenMode || (prevUserMsg ? prevUserMsg.mode : null);
+                const resolvedMode = item.resolvedMode || item.mode;
+                const hasSwitchedMode = Boolean(!isUser && chosenMode && resolvedMode && chosenMode !== resolvedMode);
+
+                const modeDef = MODES.find((m) => m.id === (item.mode || resolvedMode)) || MODES[0];
                 const isCopied = copiedId === msgId;
                 const isSaved = savedNoteMap[msgId];
                 const isSaving = savingNoteId === msgId;
 
-                const userQuestionText = !isUser && index > 0 && messages[index - 1].role === 'user'
-                  ? messages[index - 1].content
-                  : 'AI Explanation';
+                const userQuestionText = prevUserMsg ? prevUserMsg.content : 'illustration';
 
                 if (isUser) {
                   return (
@@ -864,9 +914,20 @@ const AskPage = () => {
                           </div>
                         </div>
 
-                        <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${modeDef.badgeColor}`}>
-                          {modeDef.name}
-                        </span>
+                        <div className="flex items-center space-x-2">
+                          {hasSwitchedMode && (
+                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-brand-100 text-brand-700 dark:bg-brand-900/40 dark:text-brand-300 border border-brand-200 dark:border-brand-800">
+                              {resolvedMode === 'image'
+                                ? 'Switched to Generate image mode'
+                                : resolvedMode === 'svg'
+                                ? 'Switched to Diagram mode'
+                                : `Switched to ${resolvedMode} mode`}
+                            </span>
+                          )}
+                          <span className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold ${modeDef.badgeColor}`}>
+                            {modeDef.name}
+                          </span>
+                        </div>
                       </div>
 
                       {/* Generated Image, SVG Diagram, or Markdown Body */}
@@ -884,7 +945,7 @@ const AskPage = () => {
 
                               <div className="flex items-center space-x-2 p-2.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-200 text-xs">
                                 <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-500" />
-                                <span>Note: Generated images are not saved in conversation history and must be downloaded now.</span>
+                                <span>Generated images are not saved in your history. Download it now.</span>
                               </div>
 
                               {item.caption && (
@@ -982,7 +1043,7 @@ const AskPage = () => {
                             <>
                               {item.image && item.image.data && (
                                 <button
-                                  onClick={() => handleDownloadGeneratedImage(item.image)}
+                                  onClick={() => handleDownloadGeneratedImage(item.image, userQuestionText)}
                                   className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-xs flex items-center space-x-1.5 shadow-sm transition-all"
                                   title="Download illustration"
                                 >
@@ -1105,10 +1166,14 @@ const AskPage = () => {
                   </div>
                   <div>
                     <h4 className="text-sm font-bold text-slate-900 dark:text-white">
-                      Analyzing {attachedImage ? 'Image & Question' : 'Question'} in {currentModeObj.name}...
+                      {selectedMode === 'image'
+                        ? 'Generating your image, this can take up to a minute'
+                        : `Analyzing ${attachedImage ? 'Image & Question' : 'Question'} in ${currentModeObj.name}...`}
                     </h4>
                     <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                      Referencing academic concepts and preparing syllabus explanation.
+                      {selectedMode === 'image'
+                        ? 'Creating clean educational illustration with Gemini AI.'
+                        : 'Referencing academic concepts and preparing syllabus explanation.'}
                     </p>
                   </div>
                 </div>
@@ -1232,7 +1297,7 @@ const AskPage = () => {
                   </label>
                   <select
                     value={selectedMode}
-                    onChange={(e) => setSelectedMode(e.target.value)}
+                    onChange={(e) => handleModeChange(e.target.value)}
                     disabled={loading}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-brand-500 cursor-pointer"
                   >

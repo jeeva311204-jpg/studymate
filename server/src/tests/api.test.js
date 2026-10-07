@@ -17,7 +17,8 @@ const QuizResult = require('../models/QuizResult');
 const AskUsage = require('../models/AskUsage');
 const Conversation = require('../models/Conversation');
 const geminiConfig = require('../config/gemini');
-const { getKolkataDateString } = require('../controllers/askController');
+const { getKolkataDateString, isImageGenerationRequest, isSvgDiagramRequest } = require('../controllers/askController');
+const { generateGeminiImage, ImageGenError } = require('../utils/geminiImage');
 const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
 
 process.env.PORT = '5001';
@@ -1891,15 +1892,70 @@ Simple triangle diagram
       }
     });
 
-    it('9.2 returns 503 with a clear message and no raw text when mock API rejects for billing', async () => {
+    it('9.2 GET /api/ask/capabilities requires auth and returns correct imageGeneration boolean', async () => {
       const origModel = process.env.GEMINI_IMAGE_MODEL;
-      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
 
-      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
-      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
-        const err = new Error('Google Cloud billing is required to use imagen-3.0');
-        err.status = 400;
-        throw err;
+      try {
+        // Without auth -> 401
+        const unauthRes = await request(server).get('/api/ask/capabilities');
+        assert.equal(unauthRes.status, 401);
+
+        // With GEMINI_IMAGE_MODEL set -> true
+        process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+        const resTrue = await request(server)
+          .get('/api/ask/capabilities')
+          .set('Authorization', authGenImgUser);
+        assert.equal(resTrue.status, 200);
+        assert.deepEqual(resTrue.body, { imageGeneration: true });
+
+        // With GEMINI_IMAGE_MODEL unset -> false
+        delete process.env.GEMINI_IMAGE_MODEL;
+        const resFalse = await request(server)
+          .get('/api/ask/capabilities')
+          .set('Authorization', authGenImgUser);
+        assert.equal(resFalse.status, 200);
+        assert.deepEqual(resFalse.body, { imageGeneration: false });
+      } finally {
+        if (origModel) {
+          process.env.GEMINI_IMAGE_MODEL = origModel;
+        } else {
+          delete process.env.GEMINI_IMAGE_MODEL;
+        }
+      }
+    });
+
+    it('9.3 success: stubs fetch, validates call format, returns inlineData and caption', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+      const fakeBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+      let capturedUrl = '';
+      let capturedOptions = null;
+
+      const mockFetch = mock.method(global, 'fetch', async (url, options) => {
+        capturedUrl = url;
+        capturedOptions = options;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    { text: 'A clean scientific diagram of a plant cell.' },
+                    {
+                      inlineData: {
+                        mimeType: 'image/png',
+                        data: fakeBase64,
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        };
       });
 
       try {
@@ -1907,91 +1963,75 @@ Simple triangle diagram
           .post('/api/ask')
           .set('Authorization', authGenImgUser)
           .send({
-            question: 'Draw a plant cell diagram',
+            question: 'A simple labelled diagram of a plant cell',
             mode: 'image',
           });
 
-        assert.equal(res.status, 503);
-        assert.equal(res.body.error, true);
-        assert.match(res.body.message, /billing.*required/i);
-        assert.ok(!res.body.message.includes('imagen-3.0'), 'Must not leak raw model or error text');
+        assert.equal(res.status, 200);
+        assert.equal(res.body.mode, 'image');
+        assert.equal(res.body.resolvedMode, 'image');
+        assert.ok(res.body.image);
+        assert.equal(res.body.image.mimeType, 'image/png');
+        assert.equal(res.body.image.data, fakeBase64);
+        assert.equal(res.body.caption, 'A clean scientific diagram of a plant cell.');
+        assert.ok(res.body.conversationId);
+
+        // Verify call format
+        assert.match(capturedUrl, /models\/gemini-3\.1-flash-lite-image:generateContent/);
+        assert.equal(capturedOptions.method, 'POST');
+        assert.equal(capturedOptions.headers['Content-Type'], 'application/json');
+        assert.ok(capturedOptions.headers['x-goog-api-key']);
+        const sentBody = JSON.parse(capturedOptions.body);
+        assert.deepEqual(sentBody.generationConfig.responseModalities, ['TEXT', 'IMAGE']);
+        assert.match(sentBody.contents[0].parts[0].text, /educational illustration/i);
       } finally {
-        mockGetClient.mock.restore();
-        mockGenImg.mock.restore();
+        mockFetch.mock.restore();
         if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
       }
     });
 
-    it('9.3 returns 503 with a clear message when mock API rejects for quota', async () => {
+    it('9.4 429 quota error: maps to status 429 with clear message and no raw text', async () => {
       const origModel = process.env.GEMINI_IMAGE_MODEL;
-      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
 
-      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
-      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
-        const err = new Error('ResourceExhausted: 429 Rate limit / quota exceeded');
-        err.status = 429;
-        throw err;
-      });
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: false,
+        status: 429,
+        json: async () => ({
+          error: { message: 'ResourceExhausted: Quota exceeded for quota group ...' },
+        }),
+      }));
 
       try {
         const res = await request(server)
           .post('/api/ask')
           .set('Authorization', authGenImgUser)
           .send({
-            question: 'Draw an animal cell diagram',
+            question: 'Illustrate mitochondria',
             mode: 'image',
           });
 
-        assert.equal(res.status, 503);
+        assert.equal(res.status, 429);
         assert.equal(res.body.error, true);
         assert.match(res.body.message, /quota exceeded/i);
+        assert.ok(!res.body.message.includes('ResourceExhausted'), 'Must not leak raw Google error text');
       } finally {
-        mockGetClient.mock.restore();
-        mockGenImg.mock.restore();
+        mockFetch.mock.restore();
         if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
       }
     });
 
-    it('9.4 returns 503 with a clear message when mock API rejects for safety block', async () => {
+    it('9.5 403 permission/billing error: maps to status 503 with clear message', async () => {
       const origModel = process.env.GEMINI_IMAGE_MODEL;
-      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
 
-      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
-      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
-        const err = new Error('SAFETY_VIOLATION: blocked by content safety policy');
-        err.status = 400;
-        throw err;
-      });
-
-      try {
-        const res = await request(server)
-          .post('/api/ask')
-          .set('Authorization', authGenImgUser)
-          .send({
-            question: 'Unsafe image request',
-            mode: 'image',
-          });
-
-        assert.equal(res.status, 503);
-        assert.equal(res.body.error, true);
-        assert.match(res.body.message, /safety filter/i);
-      } finally {
-        mockGetClient.mock.restore();
-        mockGenImg.mock.restore();
-        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
-      }
-    });
-
-    it('9.5 returns 503 with a clear message when mock API rejects for key permission', async () => {
-      const origModel = process.env.GEMINI_IMAGE_MODEL;
-      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
-
-      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
-      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
-        const err = new Error('Permission denied: model not available on this API key');
-        err.status = 403;
-        throw err;
-      });
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: false,
+        status: 403,
+        json: async () => ({
+          error: { message: 'The caller does not have permission / billing required' },
+        }),
+      }));
 
       try {
         const res = await request(server)
@@ -2004,39 +2044,202 @@ Simple triangle diagram
 
         assert.equal(res.status, 503);
         assert.equal(res.body.error, true);
-        assert.match(res.body.message, /not available on this API key/i);
+        assert.match(res.body.message, /not available.*or requires billing/i);
+        assert.ok(!res.body.message.includes('The caller does not have permission'));
       } finally {
-        mockGetClient.mock.restore();
-        mockGenImg.mock.restore();
+        mockFetch.mock.restore();
         if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
       }
     });
 
-    it('9.6 daily cap of 5 generated images returns 429 and gives slot back on failure', async () => {
+    it('9.6 404 model not found: maps to status 503 with clear message', async () => {
       const origModel = process.env.GEMINI_IMAGE_MODEL;
-      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-nonexistent-image';
+
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: false,
+        status: 404,
+        json: async () => ({
+          error: { message: 'models/gemini-nonexistent-image is not found' },
+        }),
+      }));
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Illustrate DNA structure',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 503);
+        assert.equal(res.body.error, true);
+        assert.match(res.body.message, /model is not available/i);
+        assert.ok(!res.body.message.includes('gemini-nonexistent-image'));
+      } finally {
+        mockFetch.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.7 response without an image part: returns 502', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: 'Here is some text without an image.' }],
+              },
+            },
+          ],
+        }),
+      }));
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Illustrate photosynthesis',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 502);
+        assert.equal(res.body.error, true);
+        assert.match(res.body.message, /did not return an image/i);
+      } finally {
+        mockFetch.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.8 safety block: candidate.finishReason SAFETY or promptFeedback blockReason returns 400', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+
+      // 1. Candidate finishReason SAFETY
+      let mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              finishReason: 'SAFETY',
+              content: { parts: [] },
+            },
+          ],
+        }),
+      }));
+
+      try {
+        const res1 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Unsafe image topic',
+            mode: 'image',
+          });
+
+        assert.equal(res1.status, 400);
+        assert.equal(res1.body.error, true);
+        assert.match(res1.body.message, /safety filter/i);
+
+        mockFetch.mock.restore();
+
+        // 2. promptFeedback blockReason SAFETY
+        mockFetch = mock.method(global, 'fetch', async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            promptFeedback: { blockReason: 'SAFETY' },
+          }),
+        }));
+
+        const res2 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Harmful image topic',
+            mode: 'image',
+          });
+
+        assert.equal(res2.status, 400);
+        assert.equal(res2.body.error, true);
+        assert.match(res2.body.message, /safety filter/i);
+      } finally {
+        mockFetch.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.9 timeout (AbortError): returns 503 timeout message', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+
+      const mockFetch = mock.method(global, 'fetch', async () => {
+        const abortErr = new Error('The operation was aborted');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      });
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Long running image generation',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 503);
+        assert.equal(res.body.error, true);
+        assert.match(res.body.message, /timed out after 60 seconds/i);
+      } finally {
+        mockFetch.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.10 daily cap of 5 generated images returns 429 and gives slot back on failure', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
       const today = getKolkataDateString();
 
-      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
       let shouldFail = true;
-      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => {
+      const mockFetch = mock.method(global, 'fetch', async () => {
         if (shouldFail) {
-          const err = new Error('Upstream transient glitch');
-          err.status = 500;
-          throw err;
+          throw new Error('Connection refused');
         }
         return {
-          image: { mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' },
-          caption: 'Educational diagram of photosynthesis',
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    { text: 'Chloroplast structure' },
+                    { inlineData: { mimeType: 'image/png', data: 'fakeBytes' } },
+                  ],
+                },
+              },
+            ],
+          }),
         };
       });
 
       try {
-        // 1. Initial usage is 0
+        // Initial usage is 0
         const usageBefore = await AskUsage.findOne({ user: genImgUser._id, date: today });
         assert.equal(usageBefore?.imageCount || 0, 0);
 
-        // 2. Request fails -> slot must be given back
+        // Request fails -> slot must be refunded
         const failRes = await request(server)
           .post('/api/ask')
           .set('Authorization', authGenImgUser)
@@ -2049,7 +2252,7 @@ Simple triangle diagram
         const usageAfterFail = await AskUsage.findOne({ user: genImgUser._id, date: today });
         assert.equal(usageAfterFail?.imageCount || 0, 0, 'Slot must be refunded after failure');
 
-        // 3. Set imageCount to 5 (limit reached)
+        // Set imageCount to 5 (cap reached)
         await AskUsage.updateOne(
           { user: genImgUser._id, date: today },
           { imageCount: 5 },
@@ -2067,24 +2270,31 @@ Simple triangle diagram
         assert.equal(capRes.status, 429);
         assert.match(capRes.body.message, /daily image generation limit reached/i);
       } finally {
-        mockGetClient.mock.restore();
-        mockGenImg.mock.restore();
+        mockFetch.mock.restore();
         if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
       }
     });
 
-    it('9.7 successful mock returns image fields and saves prompt without storing base64', async () => {
+    it('9.11 image base64 data is NEVER stored in MongoDB conversation or returned in conversation history', async () => {
       const origModel = process.env.GEMINI_IMAGE_MODEL;
-      process.env.GEMINI_IMAGE_MODEL = 'imagen-3.0-generate-002';
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
       const fakeBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 
-      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
-      const mockGenImg = mock.method(geminiConfig, 'generateImage', async () => ({
-        image: {
-          mimeType: 'image/png',
-          data: fakeBase64,
-        },
-        caption: 'A cross-section illustration of the human heart',
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: 'A cross-section illustration of the human heart' },
+                  { inlineData: { mimeType: 'image/png', data: fakeBase64 } },
+                ],
+              },
+            },
+          ],
+        }),
       }));
 
       try {
@@ -2097,14 +2307,10 @@ Simple triangle diagram
           });
 
         assert.equal(res.status, 200);
-        assert.equal(res.body.mode, 'image');
-        assert.ok(res.body.image);
-        assert.equal(res.body.image.mimeType, 'image/png');
         assert.equal(res.body.image.data, fakeBase64);
-        assert.match(res.body.caption, /human heart/i);
         assert.ok(res.body.conversationId);
 
-        // Verify Conversation record in MongoDB
+        // Verify MongoDB record
         const conv = await Conversation.findById(res.body.conversationId);
         assert.ok(conv);
         assert.equal(conv.messages.length, 2);
@@ -2113,13 +2319,188 @@ Simple triangle diagram
         assert.equal(conv.messages[1].role, 'assistant');
         assert.equal(conv.messages[1].mode, 'image');
         assert.equal(conv.messages[1].generatedImage, true);
-        // CRITICAL CHECK: Base64 image data is NOT stored in conversation
-        assert.ok(!conv.messages[1].content.includes(fakeBase64), 'Image base64 data must NEVER be stored in DB');
+        assert.ok(!conv.messages[1].content.includes(fakeBase64), 'Base64 must not be in content');
         assert.equal(conv.messages[1].svg, null);
+
+        // Verify GET /api/ask/conversations/:id does NOT contain base64
+        const getRes = await request(server)
+          .get(`/api/ask/conversations/${conv._id}`)
+          .set('Authorization', authGenImgUser);
+        assert.equal(getRes.status, 200);
+        const returnedJson = JSON.stringify(getRes.body);
+        assert.ok(!returnedJson.includes(fakeBase64), 'Conversation history response must never return base64');
+      } finally {
+        mockFetch.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.12 auto mode routing: matches image request and routes to image mode', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: 'Illustration of nature' },
+                  { inlineData: { mimeType: 'image/png', data: 'data123' } },
+                ],
+              },
+            },
+          ],
+        }),
+      }));
+
+      try {
+        // Match 1: "generate the image of nature"
+        const res1 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'generate the image of nature',
+            mode: 'auto',
+          });
+
+        assert.equal(res1.status, 200);
+        assert.equal(res1.body.resolvedMode, 'image');
+        assert.ok(res1.body.image);
+
+        // Match 2: "draw a picture of a cell"
+        const res2 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'draw a picture of a cell',
+            mode: 'auto',
+          });
+
+        assert.equal(res2.status, 200);
+        assert.equal(res2.body.resolvedMode, 'image');
+        assert.ok(res2.body.image);
+      } finally {
+        mockFetch.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.13 auto mode routing: image request when GEMINI_IMAGE_MODEL is missing returns normal 200 fallback without counting against cap', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      delete process.env.GEMINI_IMAGE_MODEL;
+      const today = getKolkataDateString();
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'generate the image of nature',
+            mode: 'auto',
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.resolvedMode, 'image');
+        assert.equal(
+          res.body.answer,
+          "Image generation isn't enabled on this site yet. Choose Diagram (SVG) for a downloadable diagram."
+        );
+
+        // Verify NOT counted against image cap
+        const usage = await AskUsage.findOne({ user: genImgUser._id, date: today });
+        assert.equal(usage?.imageCount || 0, 0);
+        assert.equal(usage?.count || 0, 0);
+      } finally {
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+      }
+    });
+
+    it('9.14 auto mode routing: matches SVG request and routes to svg mode', async () => {
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => `=== DESCRIPTION ===
+Flowchart of algorithms
+=== SVG ===
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40"/></svg>`
+      );
+
+      try {
+        // Match 1: "draw a flowchart of sorting"
+        const res1 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'draw a flowchart of sorting',
+            mode: 'auto',
+          });
+
+        assert.equal(res1.status, 200);
+        assert.equal(res1.body.resolvedMode, 'svg');
+        assert.ok(res1.body.svg);
+
+        // Match 2: "generate svg of solar system"
+        const res2 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'generate svg of solar system',
+            mode: 'auto',
+          });
+
+        assert.equal(res2.status, 200);
+        assert.equal(res2.body.resolvedMode, 'svg');
+        assert.ok(res2.body.svg);
       } finally {
         mockGetClient.mock.restore();
-        mockGenImg.mock.restore();
-        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('9.15 auto mode routing: non-matches (what is a diagram, describe this picture, uploaded image) do NOT route to image or svg', async () => {
+      // Direct unit tests for helper functions
+      assert.equal(isImageGenerationRequest('generate the image of nature'), true);
+      assert.equal(isImageGenerationRequest('draw a picture of a cell'), true);
+      assert.equal(isImageGenerationRequest('what is a diagram'), false);
+      assert.equal(isImageGenerationRequest('describe this picture'), false);
+
+      assert.equal(isSvgDiagramRequest('what is a diagram'), false);
+      assert.equal(isSvgDiagramRequest('generate svg of solar system'), true);
+      assert.equal(isSvgDiagramRequest('draw a diagram of the heart'), true);
+
+      // Integration test with server: "what is a diagram" calls normal text model
+      let textPromptCalled = false;
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => {
+          textPromptCalled = true;
+          return '[MODE: doubt]\nA diagram is a symbolic representation of information.';
+        }
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'what is a diagram',
+            mode: 'auto',
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(textPromptCalled, true, 'Must call normal text model fallback');
+        assert.equal(res.body.resolvedMode, 'doubt');
+        assert.equal(res.body.image, undefined);
+        assert.equal(res.body.svg, undefined);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
       }
     });
   });

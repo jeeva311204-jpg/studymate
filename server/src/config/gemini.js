@@ -139,92 +139,10 @@ const generateWithModelFallback = async (prompt, options = {}) => {
   throw cleanError;
 };
 
-/**
- * Calls Google AI / Gemini API to generate an educational illustration
- * @param {string} prompt - Educational illustration prompt
- * @param {object} options - Generation options (model, etc.)
- * @returns {Promise<{ image: { mimeType: string, data: string }, caption: string }>}
- */
-const generateImage = async (prompt, options = {}) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'your_gemini_api_key_here') {
-    const err = new Error('GEMINI_API_KEY is not configured in server/.env.');
-    err.status = 503;
-    throw err;
-  }
-
-  const modelName = options.model || process.env.GEMINI_IMAGE_MODEL;
-  if (!modelName || !modelName.trim()) {
-    const err = new Error('Image generation is not configured');
-    err.status = 503;
-    throw err;
-  }
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    modelName
-  )}:predict?key=${encodeURIComponent(apiKey)}`;
-
-  const payload = {
-    instances: [{ prompt }],
-    parameters: {
-      sampleCount: 1,
-      aspectRatio: options.aspectRatio || '1:1',
-      outputMimeType: options.outputMimeType || 'image/png',
-    },
-  };
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const responseData = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const apiError = responseData.error || {};
-    const errMsg = apiError.message || response.statusText || 'Google AI image generation rejected';
-    const err = new Error(errMsg);
-    err.status = response.status;
-    err.code = apiError.code;
-    err.details = apiError.details;
-    throw err;
-  }
-
-  let base64Data = null;
-  let mimeType = 'image/png';
-
-  if (responseData.predictions && responseData.predictions[0]) {
-    const pred = responseData.predictions[0];
-    base64Data = pred.bytesBase64Encoded || pred.data || pred.image;
-    if (pred.mimeType) mimeType = pred.mimeType;
-  } else if (responseData.generatedImages && responseData.generatedImages[0]) {
-    const gen = responseData.generatedImages[0];
-    base64Data = gen.image?.imageBytes || gen.image?.data;
-    if (gen.image?.mimeType) mimeType = gen.image.mimeType;
-  }
-
-  if (!base64Data) {
-    const emptyErr = new Error('Google AI returned an empty image response.');
-    emptyErr.status = 502;
-    throw emptyErr;
-  }
-
-  return {
-    image: {
-      mimeType,
-      data: base64Data,
-    },
-    caption: `Educational illustration for: ${prompt.slice(0, 100)}`,
-  };
-};
-
 module.exports = {
   getGeminiClient,
   getGenerativeModel,
   generateWithModelFallback,
-  generateImage,
   isModelNotFoundError,
 };
+

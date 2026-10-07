@@ -4,6 +4,7 @@ const AskUsage = require('../models/AskUsage');
 const Conversation = require('../models/Conversation');
 const geminiConfig = require('../config/gemini');
 const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
+const { generateGeminiImage, ImageGenError } = require('../utils/geminiImage');
 
 const ALLOWED_MODES = ['auto', 'doubt', 'mark2', 'mark8', 'mark16', 'short_notes', 'simple', 'svg', 'image'];
 
@@ -39,47 +40,28 @@ const MODE_PROMPT_INSTRUCTIONS = {
 };
 
 /**
- * Classifies Google AI image generation rejection reasons into clean 503 messages with no raw error text
+ * Auto mode detection: IMAGE request
+ * Creation verb near image noun (image, picture, photo, illustration, drawing, poster)
  */
-const classifyGoogleImageError = (err) => {
-  const msg = (err.message || '').toLowerCase();
-  const status = err.status || (err.response && err.response.status);
-
-  if (msg.includes('billing') || msg.includes('payment') || msg.includes('billable')) {
-    return 'Image generation is unavailable: billing required for this model.';
-  }
-  if (msg.includes('quota') || msg.includes('rate limit') || msg.includes('resource_exhausted') || status === 429) {
-    return 'Image generation is temporarily unavailable: Google AI quota exceeded. Please try again later.';
-  }
-  if (
-    msg.includes('safety') ||
-    msg.includes('blocked') ||
-    msg.includes('harm') ||
-    msg.includes('violat') ||
-    msg.includes('policy') ||
-    msg.includes('unsafe') ||
-    msg.includes('filter') ||
-    msg.includes('refuse')
-  ) {
-    return 'Image generation was blocked by safety filters. Only safe educational illustrations are allowed.';
-  }
-  if (
-    msg.includes('not available on this key') ||
-    msg.includes('key') ||
-    msg.includes('permission') ||
-    msg.includes('forbidden') ||
-    msg.includes('not supported') ||
-    msg.includes('unauthorized') ||
-    msg.includes('not found') ||
-    status === 403 ||
-    status === 401 ||
-    status === 404
-  ) {
-    return 'Image generation is not available on this API key. Please check your model access permissions.';
-  }
-
-  return 'Image generation failed because the request was rejected by Google AI service.';
+const isImageGenerationRequest = (text) => {
+  if (!text || typeof text !== 'string') return false;
+  const pattern1 = /\b(generate|create|make|draw|produce)\b(?:\s+\S+){0,5}\s+\b(images?|pictures?|photos?|illustrations?|drawings?|posters?)\b/i;
+  const pattern2 = /\b(images?|pictures?|photos?|illustrations?|drawings?|posters?)\b(?:\s+\S+){0,5}\s+\b(generate|create|make|draw|produce)\b/i;
+  return pattern1.test(text) || pattern2.test(text);
 };
+
+/**
+ * Auto mode detection: SVG request
+ * The word "svg", or a creation verb near diagram / flowchart / chart
+ */
+const isSvgDiagramRequest = (text) => {
+  if (!text || typeof text !== 'string') return false;
+  if (/\bsvg\b/i.test(text)) return true;
+  const pattern1 = /\b(generate|create|make|draw|produce)\b(?:\s+\S+){0,5}\s+\b(diagrams?|flowcharts?|charts?)\b/i;
+  const pattern2 = /\b(diagrams?|flowcharts?|charts?)\b(?:\s+\S+){0,5}\s+\b(generate|create|make|draw|produce)\b/i;
+  return pattern1.test(text) || pattern2.test(text);
+};
+
 
 /**
  * Validates real magic bytes / file signature.
@@ -280,8 +262,64 @@ exports.askQuestion = async (req, res) => {
       }
     }
 
-    // 5.5 Handle "image" mode (Generate Image)
-    if (mode === 'image') {
+    // 5.5 Auto mode routing & Image Mode handling
+    let effectiveMode = mode;
+    if (mode === 'auto' && !hasImage) {
+      if (isImageGenerationRequest(trimmedQuestion)) {
+        const configuredImageModel = process.env.GEMINI_IMAGE_MODEL;
+        if (configuredImageModel && configuredImageModel.trim()) {
+          effectiveMode = 'image';
+        } else {
+          // Normal 200 answer without counting against image cap or daily ask cap
+          const fallbackAnswer =
+            "Image generation isn't enabled on this site yet. Choose Diagram (SVG) for a downloadable diagram.";
+          let savedConversationId = null;
+          const userMessage = {
+            role: 'user',
+            content: trimmedQuestion,
+            mode: 'auto',
+            hasImage: false,
+            createdAt: new Date(),
+          };
+          const assistantMessage = {
+            role: 'assistant',
+            content: fallbackAnswer,
+            mode: 'image',
+            hasImage: false,
+            createdAt: new Date(),
+          };
+
+          if (existingConversation) {
+            existingConversation.messages.push(userMessage);
+            existingConversation.messages.push(assistantMessage);
+            existingConversation.updatedAt = new Date();
+            await existingConversation.save();
+            savedConversationId = existingConversation._id;
+          } else {
+            const title = trimmedQuestion.slice(0, 60);
+            const newConversation = new Conversation({
+              user: req.user._id,
+              title,
+              messages: [userMessage, assistantMessage],
+            });
+            await newConversation.save();
+            savedConversationId = newConversation._id;
+          }
+
+          return res.status(200).json({
+            answer: fallbackAnswer,
+            mode: 'image',
+            resolvedMode: 'image',
+            truncated: false,
+            conversationId: savedConversationId,
+          });
+        }
+      } else if (isSvgDiagramRequest(trimmedQuestion)) {
+        effectiveMode = 'svg';
+      }
+    }
+
+    if (effectiveMode === 'image') {
       const imageModel = process.env.GEMINI_IMAGE_MODEL;
       if (!imageModel || !imageModel.trim()) {
         return res.status(503).json({
@@ -290,8 +328,8 @@ exports.askQuestion = async (req, res) => {
         });
       }
 
-      const client = geminiConfig.getGeminiClient();
-      if (!client) {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey || apiKey === 'your_gemini_api_key_here') {
         return res.status(503).json({
           error: true,
           message: 'Ask AI service is unavailable: GEMINI_API_KEY is not configured in server/.env.',
@@ -299,18 +337,28 @@ exports.askQuestion = async (req, res) => {
       }
 
       today = getKolkataDateString();
-      let reservedImage = null;
+      let reservedSlotObj = null;
       try {
-        reservedImage = await AskUsage.findOneAndUpdate(
-          { user: req.user._id, date: today, imageCount: { $lt: DAILY_IMAGE_LIMIT } },
-          { $inc: { imageCount: 1 } },
+        reservedSlotObj = await AskUsage.findOneAndUpdate(
+          {
+            user: req.user._id,
+            date: today,
+            count: { $lt: DAILY_ASK_LIMIT },
+            imageCount: { $lt: DAILY_IMAGE_LIMIT },
+          },
+          { $inc: { count: 1, imageCount: 1 } },
           { upsert: true, new: true }
         );
       } catch (err) {
         if (err.code === 11000) {
-          reservedImage = await AskUsage.findOneAndUpdate(
-            { user: req.user._id, date: today, imageCount: { $lt: DAILY_IMAGE_LIMIT } },
-            { $inc: { imageCount: 1 } },
+          reservedSlotObj = await AskUsage.findOneAndUpdate(
+            {
+              user: req.user._id,
+              date: today,
+              count: { $lt: DAILY_ASK_LIMIT },
+              imageCount: { $lt: DAILY_IMAGE_LIMIT },
+            },
+            { $inc: { count: 1, imageCount: 1 } },
             { new: true }
           );
         } else {
@@ -318,7 +366,14 @@ exports.askQuestion = async (req, res) => {
         }
       }
 
-      if (!reservedImage) {
+      if (!reservedSlotObj) {
+        const usage = await AskUsage.findOne({ user: req.user._id, date: today });
+        if (usage && usage.count >= DAILY_ASK_LIMIT) {
+          return res.status(429).json({
+            error: true,
+            message: `Daily ask limit reached (${DAILY_ASK_LIMIT} asks per day). Please try again tomorrow.`,
+          });
+        }
         return res.status(429).json({
           error: true,
           message: `Daily image generation limit reached (${DAILY_IMAGE_LIMIT} images per day). Please try again tomorrow.`,
@@ -327,44 +382,27 @@ exports.askQuestion = async (req, res) => {
 
       let generatedResult;
       try {
-        const imagePrompt = `You are StudyMate AI educational illustrator. Create a clear, high-quality educational illustration for the following study topic.
-Requirements:
-1. The image must strictly be an educational illustration for academic learning and concept explanation.
-2. Refuse any unsafe, harmful, explicit, or unrelated non-educational requests.
-Topic: "${trimmedQuestion}"`;
-
-        generatedResult = await geminiConfig.generateImage(imagePrompt, { model: imageModel });
-      } catch (genErr) {
-        console.error('[AskController] Image generation error:', genErr.message);
+        generatedResult = await generateGeminiImage(trimmedQuestion);
+      } catch (imgErr) {
+        // Roll back both reserved slots on failure
         await AskUsage.updateOne(
           { user: req.user._id, date: today },
-          { $inc: { imageCount: -1 } }
+          { $inc: { count: -1, imageCount: -1 } }
         ).catch(() => {});
 
-        return res.status(503).json({
+        const statusCode = imgErr.status || 503;
+        return res.status(statusCode).json({
           error: true,
-          message: classifyGoogleImageError(genErr),
+          message: imgErr.message || 'Image generation failed.',
         });
       }
 
-      if (!generatedResult || !generatedResult.image || !generatedResult.image.data) {
-        await AskUsage.updateOne(
-          { user: req.user._id, date: today },
-          { $inc: { imageCount: -1 } }
-        ).catch(() => {});
-
-        return res.status(503).json({
-          error: true,
-          message: 'Image generation failed because the model returned an empty result.',
-        });
-      }
-
-      // Persist messages to conversation (save prompt and marker, never store image data)
+      // Persist messages to conversation (never store image base64 bytes)
       let savedConversationId = null;
       const userMessage = {
         role: 'user',
         content: trimmedQuestion,
-        mode: 'image',
+        mode,
         hasImage: false,
         createdAt: new Date(),
       };
@@ -402,6 +440,7 @@ Topic: "${trimmedQuestion}"`;
         caption: generatedResult.caption || `Educational illustration for: ${trimmedQuestion}`,
         answer: generatedResult.caption || `Educational illustration for: ${trimmedQuestion}`,
         mode: 'image',
+        resolvedMode: 'image',
         truncated: false,
         conversationId: savedConversationId,
       });
@@ -453,8 +492,9 @@ Topic: "${trimmedQuestion}"`;
     }
 
     // 8. Build prompt including conversation history and image instructions
-    const modeInstruction = MODE_PROMPT_INSTRUCTIONS[mode];
-    const maxTokens = MODE_MAX_TOKENS[mode] || 1024;
+    const modeInstruction = MODE_PROMPT_INSTRUCTIONS[effectiveMode];
+    const maxTokens = MODE_MAX_TOKENS[effectiveMode] || 1024;
+
 
     let historyBlock = '';
     if (existingConversation && existingConversation.messages && existingConversation.messages.length > 0) {
@@ -572,10 +612,10 @@ Student Question:
     }
 
     // 11. Resolve final mode and clean answer if mode was auto
-    let resolvedMode = mode;
+    let resolvedMode = effectiveMode;
     let finalAnswer = rawAnswer.trim();
 
-    if (mode === 'auto') {
+    if (effectiveMode === 'auto') {
       const modeMatch = finalAnswer.match(/\[MODE:\s*([a-zA-Z0-9_]+)\]/i);
       if (modeMatch) {
         const detected = modeMatch[1].toLowerCase();
@@ -701,6 +741,7 @@ Student Question:
         description,
         answer: sanitizedSvg,
         mode: 'svg',
+        resolvedMode: 'svg',
         truncated,
         conversationId: savedConversationId,
       });
@@ -743,6 +784,7 @@ Student Question:
     return res.status(200).json({
       answer: finalAnswer,
       mode: resolvedMode,
+      resolvedMode,
       truncated,
       conversationId: savedConversationId,
     });
@@ -908,5 +950,18 @@ exports.deleteConversation = async (req, res) => {
   }
 };
 
+/**
+ * @desc    Get AI capabilities (checks if image generation is configured)
+ * @route   GET /api/ask/capabilities
+ * @access  Private
+ */
+exports.getCapabilities = async (req, res) => {
+  const model = process.env.GEMINI_IMAGE_MODEL;
+  const imageGeneration = Boolean(model && model.trim());
+  return res.status(200).json({ imageGeneration });
+};
+
 exports.getKolkataDateString = getKolkataDateString;
 exports.detectImageMimeType = detectImageMimeType;
+exports.isImageGenerationRequest = isImageGenerationRequest;
+exports.isSvgDiagramRequest = isSvgDiagramRequest;

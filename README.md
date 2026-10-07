@@ -240,6 +240,7 @@ npm run client
   | `JWT_SECRET` | Required | Secret key used to sign and verify student JWT authentication tokens | `your_strong_jwt_secret_here` |
   | `GEMINI_API_KEY` | Required for AI | Google Gemini API key from Google AI Studio | `AIzaSy...` |
   | `GEMINI_MODEL` | Optional | Google Gemini model identifier | `gemini-3.5-flash-lite` |
+  | `GEMINI_IMAGE_MODEL` | Optional | Gemini image generation model identifier (e.g. `gemini-3.1-flash-lite-image`). Set only after testing access on your key. | (empty) |
   | `MAX_NOTE_CHARACTERS` | Optional | Maximum character length for AI processing | `100000` |
   | `CLIENT_URL` | Required in prod | Allowed frontend URL for CORS origin checking (comma-separated for multiple origins) | `https://studymate.vercel.app` |
 
