@@ -165,12 +165,66 @@ exports.askQuestion = async (req, res) => {
   let today = '';
 
   try {
-    const { question, mode, noteId, conversationId } = req.body;
+    const { question, mode, noteId, conversationId, regenerate } = req.body;
     const hasImage = Boolean(req.file);
+
+    let isRegenerate = false;
+    let regeneratePrompt = null;
+    let regenerateSeed = null;
+    let targetMessage = null;
+    let existingConversation = null;
+
+    if (regenerate !== undefined) {
+      if (!regenerate || typeof regenerate !== 'object' || !regenerate.conversationId || !regenerate.messageId) {
+        return res.status(400).json({
+          error: true,
+          message: 'Invalid regenerate parameters. Both conversationId and messageId are required.',
+        });
+      }
+
+      if (!mongoose.isValidObjectId(regenerate.conversationId) || !mongoose.isValidObjectId(regenerate.messageId)) {
+        return res.status(400).json({
+          error: true,
+          message: 'Invalid conversationId or messageId format.',
+        });
+      }
+
+      const targetConv = await Conversation.findOne({
+        _id: regenerate.conversationId,
+        user: req.user._id,
+      });
+
+      if (!targetConv) {
+        return res.status(404).json({
+          error: true,
+          message: 'Conversation not found or does not belong to you.',
+        });
+      }
+
+      targetMessage = targetConv.messages.id(regenerate.messageId);
+      if (!targetMessage) {
+        return res.status(404).json({
+          error: true,
+          message: 'Message not found in conversation.',
+        });
+      }
+
+      if (!targetMessage.imagePrompt || targetMessage.imageSeed === undefined || targetMessage.imageSeed === null) {
+        return res.status(400).json({
+          error: true,
+          message: 'This message cannot be regenerated as an exact image (missing prompt or seed).',
+        });
+      }
+
+      isRegenerate = true;
+      regeneratePrompt = targetMessage.imagePrompt;
+      regenerateSeed = targetMessage.imageSeed;
+      existingConversation = targetConv;
+    }
 
     // 1. Validate image magic bytes if file was uploaded
     let detectedMimeType = null;
-    if (hasImage) {
+    if (hasImage && !isRegenerate) {
       detectedMimeType = detectImageMimeType(req.file.buffer);
       if (!detectedMimeType) {
         return res.status(400).json({
@@ -197,40 +251,43 @@ exports.askQuestion = async (req, res) => {
 
     // 2. Validate question (or apply default question if image is present without question)
     let trimmedQuestion = '';
-    if (typeof question === 'string') {
+    if (isRegenerate) {
+      trimmedQuestion = regeneratePrompt;
+    } else if (typeof question === 'string') {
       trimmedQuestion = question.trim();
     }
 
-    if (hasImage && !trimmedQuestion) {
-      trimmedQuestion = DEFAULT_IMAGE_QUESTION;
-    } else {
-      if (typeof question !== 'string') {
-        return res.status(400).json({
-          error: true,
-          message: 'Question must be a string.',
-        });
+    if (!isRegenerate) {
+      if (hasImage && !trimmedQuestion) {
+        trimmedQuestion = DEFAULT_IMAGE_QUESTION;
+      } else {
+        if (typeof question !== 'string') {
+          return res.status(400).json({
+            error: true,
+            message: 'Question must be a string.',
+          });
+        }
+
+        if (trimmedQuestion.length < 3 || trimmedQuestion.length > 2000) {
+          return res.status(400).json({
+            error: true,
+            message: 'Question must be between 3 and 2000 characters.',
+          });
+        }
       }
 
-      if (trimmedQuestion.length < 3 || trimmedQuestion.length > 2000) {
+      // 3. Validate mode
+      if (!mode || typeof mode !== 'string' || !ALLOWED_MODES.includes(mode)) {
         return res.status(400).json({
           error: true,
-          message: 'Question must be between 3 and 2000 characters.',
+          message: `Invalid mode. Allowed modes are: ${ALLOWED_MODES.join(', ')}.`,
         });
       }
-    }
-
-    // 3. Validate mode
-    if (!mode || typeof mode !== 'string' || !ALLOWED_MODES.includes(mode)) {
-      return res.status(400).json({
-        error: true,
-        message: `Invalid mode. Allowed modes are: ${ALLOWED_MODES.join(', ')}.`,
-      });
     }
 
     // 4. Validate conversationId or check user conversation limit
-    let existingConversation = null;
-
-    if (conversationId !== undefined && conversationId !== null && conversationId !== '') {
+    if (!isRegenerate) {
+      if (conversationId !== undefined && conversationId !== null && conversationId !== '') {
       if (!mongoose.isValidObjectId(conversationId)) {
         return res.status(400).json({
           error: true,
@@ -265,6 +322,7 @@ exports.askQuestion = async (req, res) => {
         });
       }
     }
+  }
 
     // 5. Validate noteId if provided
     let referenceMaterial = '';
@@ -410,8 +468,8 @@ Diagram for ${q.slice(0, 40)}
     };
 
     // 5.5 Auto mode routing & Image Mode handling
-    let effectiveMode = mode;
-    if (mode === 'auto' && !hasImage) {
+    let effectiveMode = isRegenerate ? 'image' : mode;
+    if (!isRegenerate && mode === 'auto' && !hasImage) {
       if (isImageGenerationRequest(trimmedQuestion)) {
         const provider = getImageProvider();
         if (provider !== 'none') {
@@ -468,7 +526,7 @@ Diagram for ${q.slice(0, 40)}
 
     if (effectiveMode === 'image') {
       const provider = getImageProvider();
-      const shouldFallback = (mode === 'auto') || (effectiveMode === 'image' && (provider === 'cloudflare' || Boolean(req.body.fallback || req.body.fallbackToSvg)));
+      const shouldFallback = !isRegenerate && ((mode === 'auto') || (effectiveMode === 'image' && (provider === 'cloudflare' || Boolean(req.body.fallback || req.body.fallbackToSvg))));
 
       if (provider === 'none') {
         if (shouldFallback) {
@@ -566,13 +624,14 @@ Diagram for ${q.slice(0, 40)}
       }
 
       const imagePrompt = stripTextAndLabelRequests(trimmedQuestion);
+      const seedOptions = isRegenerate && regenerateSeed !== null && regenerateSeed !== undefined ? { seed: regenerateSeed } : {};
 
       let generatedResult;
       try {
         if (provider === 'cloudflare') {
-          generatedResult = await generateCloudflareImage(imagePrompt);
+          generatedResult = await generateCloudflareImage(imagePrompt, seedOptions);
         } else {
-          generatedResult = await generateGeminiImage(imagePrompt);
+          generatedResult = await generateGeminiImage(imagePrompt, seedOptions);
         }
       } catch (imgErr) {
         // Refund both reserved slots on failure
@@ -597,68 +656,97 @@ Diagram for ${q.slice(0, 40)}
         });
       }
 
-      // Generate key parts using the text model
+      const finalSeed =
+        generatedResult.seed !== undefined
+          ? generatedResult.seed
+          : (regenerateSeed !== null && regenerateSeed !== undefined ? regenerateSeed : Math.floor(Math.random() * 4294967296));
+
+      // Generate or reuse key parts using the text model
       let keyParts = [];
-      try {
-        const keyPartsPrompt = `You are StudyMate AI, an expert academic tutor.
+      if (isRegenerate && targetMessage?.keyParts && targetMessage.keyParts.length > 0) {
+        keyParts = targetMessage.keyParts;
+      } else {
+        try {
+          const keyPartsPrompt = `You are StudyMate AI, an expert academic tutor.
 For the academic concept "${trimmedQuestion}", provide a concise list of 3 to 6 key parts, labels, or components that a student should know.
 Requirements:
 1. Return strictly 3 to 6 bullet points (using "- ").
 2. Each bullet point should concisely name a key part followed by a brief description.
 3. Return only the bullet points with no preamble, headings, or conclusion.`;
 
-        const rawKeyParts = await geminiConfig.generateWithModelFallback(keyPartsPrompt, {
-          generationConfig: { maxOutputTokens: 300 },
-        });
+          const rawKeyParts = await geminiConfig.generateWithModelFallback(keyPartsPrompt, {
+            generationConfig: { maxOutputTokens: 300 },
+          });
 
-        if (rawKeyParts && typeof rawKeyParts === 'string') {
-          keyParts = rawKeyParts
-            .split('\n')
-            .map((line) => line.trim())
-            .filter((line) => line.startsWith('*') || line.startsWith('-') || /^\d+[\.\)]/.test(line))
-            .map((line) => line.replace(/^[\*\-\d\.\)]+\s*/, '').trim())
-            .filter(Boolean)
-            .slice(0, 6);
+          if (rawKeyParts && typeof rawKeyParts === 'string') {
+            keyParts = rawKeyParts
+              .split('\n')
+              .map((line) => line.trim())
+              .filter((line) => line.startsWith('*') || line.startsWith('-') || /^\d+[\.\)]/.test(line))
+              .map((line) => line.replace(/^[\*\-\d\.\)]+\s*/, '').trim())
+              .filter(Boolean)
+              .slice(0, 6);
+          }
+        } catch (keyPartsErr) {
+          console.error('[AskController] Key parts generation error:', keyPartsErr.message);
+          keyParts = [];
         }
-      } catch (keyPartsErr) {
-        console.error('[AskController] Key parts generation error:', keyPartsErr.message);
-        keyParts = [];
       }
 
       // Persist messages to conversation (never store image base64 bytes)
       let savedConversationId = null;
-      const userMessage = {
-        role: 'user',
-        content: trimmedQuestion,
-        mode,
-        hasImage: false,
-        createdAt: new Date(),
-      };
-      const assistantMessage = {
-        role: 'assistant',
-        content: generatedResult.caption || `Generated educational illustration for: ${trimmedQuestion}`,
-        mode: 'image',
-        generatedImage: true,
-        keyParts: keyParts.length > 0 ? keyParts : undefined,
-        hasImage: false,
-        createdAt: new Date(),
-      };
+      let returnedMessageId = null;
 
-      if (existingConversation) {
-        existingConversation.messages.push(userMessage);
-        existingConversation.messages.push(assistantMessage);
-        existingConversation.updatedAt = new Date();
-        await existingConversation.save();
-        savedConversationId = existingConversation._id;
+      if (isRegenerate) {
+        if (targetMessage) {
+          if (!targetMessage.keyParts || targetMessage.keyParts.length === 0) {
+            targetMessage.keyParts = keyParts.length > 0 ? keyParts : undefined;
+          }
+          returnedMessageId = targetMessage._id;
+        }
+        if (existingConversation) {
+          existingConversation.updatedAt = new Date();
+          await existingConversation.save();
+          savedConversationId = existingConversation._id;
+        }
       } else {
-        const title = trimmedQuestion.slice(0, 60);
-        const newConversation = new Conversation({
-          user: req.user._id,
-          title,
-          messages: [userMessage, assistantMessage],
-        });
-        await newConversation.save();
-        savedConversationId = newConversation._id;
+        const userMessage = {
+          role: 'user',
+          content: trimmedQuestion,
+          mode,
+          hasImage: false,
+          createdAt: new Date(),
+        };
+        const assistantMessage = {
+          role: 'assistant',
+          content: generatedResult.caption || `Generated educational illustration for: ${trimmedQuestion}`,
+          mode: 'image',
+          generatedImage: true,
+          imagePrompt: trimmedQuestion.slice(0, 1000),
+          imageSeed: finalSeed,
+          keyParts: keyParts.length > 0 ? keyParts : undefined,
+          hasImage: false,
+          createdAt: new Date(),
+        };
+
+        if (existingConversation) {
+          existingConversation.messages.push(userMessage);
+          existingConversation.messages.push(assistantMessage);
+          existingConversation.updatedAt = new Date();
+          await existingConversation.save();
+          savedConversationId = existingConversation._id;
+          returnedMessageId = existingConversation.messages[existingConversation.messages.length - 1]._id;
+        } else {
+          const title = trimmedQuestion.slice(0, 60);
+          const newConversation = new Conversation({
+            user: req.user._id,
+            title,
+            messages: [userMessage, assistantMessage],
+          });
+          await newConversation.save();
+          savedConversationId = newConversation._id;
+          returnedMessageId = newConversation.messages[newConversation.messages.length - 1]._id;
+        }
       }
 
       return res.status(200).json({
@@ -668,11 +756,14 @@ Requirements:
         },
         caption: generatedResult.caption || `Educational illustration for: ${trimmedQuestion}`,
         answer: generatedResult.caption || `Educational illustration for: ${trimmedQuestion}`,
+        imagePrompt: trimmedQuestion.slice(0, 1000),
+        imageSeed: finalSeed,
         keyParts: keyParts.length > 0 ? keyParts : [],
         mode: 'image',
         resolvedMode: 'image',
         truncated: false,
         conversationId: savedConversationId,
+        messageId: returnedMessageId,
       });
     }
 

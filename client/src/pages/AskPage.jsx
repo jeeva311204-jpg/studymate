@@ -157,6 +157,7 @@ const AskPage = () => {
 
   // UI state
   const [loading, setLoading] = useState(false);
+  const [regeneratingMsgId, setRegeneratingMsgId] = useState(null);
   const [error, setError] = useState('');
   const [copiedId, setCopiedId] = useState(null);
   const [savingNoteId, setSavingNoteId] = useState(null);
@@ -443,6 +444,9 @@ const AskPage = () => {
         description: description || '',
         note: note || '',
         keyParts: res.data.keyParts || [],
+        imagePrompt: res.data.imagePrompt || effectiveQuestion,
+        imageSeed: res.data.imageSeed,
+        _id: res.data.messageId || undefined,
         mode: actualResolvedMode,
         chosenMode: selectedMode,
         resolvedMode: actualResolvedMode,
@@ -598,6 +602,49 @@ const AskPage = () => {
     setQuestion(promptText);
     setSelectedMode('image');
     inputRef.current?.focus();
+  };
+
+  const handleRegenerateExactImage = async (msgId) => {
+    if (!activeConversationId || !msgId || loading || regeneratingMsgId) return;
+    setRegeneratingMsgId(msgId);
+    setError(null);
+    try {
+      const res = await api.post('/api/ask', {
+        regenerate: {
+          conversationId: activeConversationId,
+          messageId: msgId,
+        },
+      });
+
+      if (res.data?.image) {
+        setMessages((prev) =>
+          prev.map((m, idx) => {
+            const mId = m._id || idx.toString();
+            if (mId === msgId) {
+              return {
+                ...m,
+                image: res.data.image,
+                caption: res.data.caption || m.caption,
+                imagePrompt: res.data.imagePrompt || m.imagePrompt,
+                imageSeed: res.data.imageSeed !== undefined ? res.data.imageSeed : m.imageSeed,
+                keyParts: res.data.keyParts && res.data.keyParts.length > 0 ? res.data.keyParts : m.keyParts,
+                generatedImage: true,
+              };
+            }
+            return m;
+          })
+        );
+      }
+    } catch (err) {
+      console.error('Regenerate exact image error:', err);
+      const rawMsg =
+        err.response?.data?.message ||
+        err.message ||
+        'Failed to regenerate exact image. Please try again.';
+      setError(typeof rawMsg === 'string' ? rawMsg : JSON.stringify(rawMsg));
+    } finally {
+      setRegeneratingMsgId(null);
+    }
   };
 
   const handleSaveAsNote = async (msgId, userQuestion, aiAnswer, mode) => {
@@ -962,17 +1009,42 @@ const AskPage = () => {
                               )}
                             </>
                           ) : (
-                            <div className="space-y-2 p-4 rounded-2xl bg-slate-100/60 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700">
-                              <div className="flex items-center space-x-2 text-xs font-semibold text-slate-700 dark:text-slate-300">
-                                <ImageIcon className="w-4 h-4 text-emerald-500" />
-                                <span>Generated Illustration (Session Expired)</span>
+                            <div className="space-y-3 p-4 rounded-2xl bg-slate-100/60 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700">
+                              <div className="flex items-start space-x-2 text-xs font-semibold text-slate-700 dark:text-slate-300">
+                                <ImageIcon className="w-4 h-4 text-emerald-500 flex-shrink-0 mt-0.5" />
+                                <div className="space-y-0.5">
+                                  <p>
+                                    Image was generated for: <span className="font-bold text-slate-900 dark:text-slate-100">{item.imagePrompt || item.content || userQuestionText}</span>
+                                  </p>
+                                  <p className="text-[11px] text-slate-400 dark:text-slate-500 font-normal">
+                                    Session Expired • Image data not stored permanently
+                                  </p>
+                                </div>
                               </div>
-                              <p className="text-xs text-slate-600 dark:text-slate-400">
-                                {item.content}
+
+                              <p className="text-[11px] text-slate-500 dark:text-slate-400 italic">
+                                Regenerating uses 1 of your 5 daily images. The result may differ slightly.
                               </p>
-                              <div className="flex items-center space-x-2 text-[11px] text-slate-400 dark:text-slate-500 italic pt-1">
-                                <Info className="w-3.5 h-3.5" />
-                                <span>Generated images are not stored permanently. Click Regenerate below to recreate it.</span>
+
+                              <div className="pt-1 flex flex-wrap items-center gap-2">
+                                <button
+                                  onClick={() => handleRegenerateExactImage(msgId)}
+                                  disabled={loading || regeneratingMsgId === msgId}
+                                  className="px-3.5 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white font-medium text-xs flex items-center space-x-1.5 shadow-sm transition-all"
+                                  title="Regenerate exact image using stored seed"
+                                >
+                                  {regeneratingMsgId === msgId ? (
+                                    <>
+                                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                      <span>Regenerating exact image...</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <RefreshCw className="w-3.5 h-3.5" />
+                                      <span>Regenerate exact image</span>
+                                    </>
+                                  )}
+                                </button>
                               </div>
                             </div>
                           )}
@@ -1070,10 +1142,10 @@ const AskPage = () => {
                       <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
                         <div className="flex items-center space-x-2">
                           {item.mode === 'image' || item.generatedImage ? (
-                            <>
+                            <div className="flex flex-wrap items-center gap-2">
                               {item.image && item.image.data && (
                                 <button
-                                  onClick={() => handleDownloadGeneratedImage(item.image, userQuestionText)}
+                                  onClick={() => handleDownloadGeneratedImage(item.image, item.imagePrompt || userQuestionText)}
                                   className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-xs flex items-center space-x-1.5 shadow-sm transition-all"
                                   title="Download illustration"
                                 >
@@ -1083,14 +1155,18 @@ const AskPage = () => {
                               )}
 
                               <button
-                                onClick={() => handleRegenerateImage(userQuestionText)}
+                                onClick={() => handleRegenerateImage(item.imagePrompt || userQuestionText)}
                                 className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium text-xs flex items-center space-x-1.5 transition-colors"
-                                title="Regenerate this image"
+                                title="Regenerate with a new random seed"
                               >
                                 <RefreshCw className="w-3.5 h-3.5" />
                                 <span>Regenerate</span>
                               </button>
-                            </>
+
+                              <span className="text-[11px] text-slate-400 dark:text-slate-500 italic ml-1">
+                                Regenerating uses 1 of your 5 daily images. The result may differ slightly.
+                              </span>
+                            </div>
                           ) : item.mode === 'svg' || item.svg ? (
                             <>
                               <button

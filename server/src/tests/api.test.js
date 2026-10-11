@@ -3386,5 +3386,406 @@ Diagram of the water cycle
         else delete process.env.IMAGE_PROVIDER;
       }
     });
+
+    it('9.25 cloudflare flux-1-schnell sends numeric seed (0..4294967295) and fixed steps (4), and returns seed', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+
+      const fakePngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      let capturedBody = null;
+      const mockFetch = mock.method(global, 'fetch', async (url, opts) => {
+        if (opts?.body) {
+          capturedBody = JSON.parse(opts.body);
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            result: { image: fakePngBase64 },
+          }),
+        };
+      });
+
+      try {
+        // Without options.seed: should generate random numeric seed
+        const resA = await generateCloudflareImage('Draw an atom');
+        assert.ok(capturedBody);
+        assert.equal(capturedBody.steps, 4);
+        assert.equal(typeof capturedBody.seed, 'number');
+        assert.ok(capturedBody.seed >= 0 && capturedBody.seed <= 4294967295);
+        assert.equal(resA.seed, capturedBody.seed);
+
+        // With options.seed: should send exact provided seed
+        const resB = await generateCloudflareImage('Draw an atom', { seed: 123456789 });
+        assert.equal(capturedBody.steps, 4);
+        assert.equal(capturedBody.seed, 123456789);
+        assert.equal(resB.seed, 123456789);
+      } finally {
+        mockFetch.mock.restore();
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+      }
+    });
+
+    it('9.26 image generation stores imagePrompt and imageSeed on message in Conversation, and NEVER stores image bytes', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'cloudflare';
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+      const today = getKolkataDateString();
+
+      await AskUsage.deleteMany({ user: genImgUser._id, date: today });
+      await GlobalImageUsage.deleteMany({ date: today });
+
+      const fakePngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          success: true,
+          result: { image: fakePngBase64 },
+        }),
+      }));
+
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => `- Chloroplast: Organelle for photosynthesis\n- Grana: Thylakoid stacks`
+      );
+
+      try {
+        const studentPrompt = 'Draw chloroplast structure';
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: studentPrompt,
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.imagePrompt, studentPrompt);
+        assert.equal(typeof res.body.imageSeed, 'number');
+        assert.ok(res.body.imageSeed >= 0 && res.body.imageSeed <= 4294967295);
+        assert.ok(res.body.conversationId);
+
+        // Verify MongoDB Conversation document
+        const conv = await Conversation.findById(res.body.conversationId);
+        assert.ok(conv);
+        assert.equal(conv.messages.length, 2);
+        const assistantMsg = conv.messages[1];
+
+        // imagePrompt and imageSeed must be stored
+        assert.equal(assistantMsg.imagePrompt, studentPrompt);
+        assert.equal(assistantMsg.imageSeed, res.body.imageSeed);
+
+        // CRITICAL: image bytes must NEVER be stored
+        assert.equal(assistantMsg.image, undefined);
+        assert.equal(assistantMsg.data, undefined);
+        const serialized = JSON.stringify(conv.toObject());
+        assert.ok(!serialized.includes(fakePngBase64), 'Image base64 bytes must never be stored in MongoDB');
+      } finally {
+        mockFetch.mock.restore();
+        mockFallback.mock.restore();
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+        else delete process.env.IMAGE_PROVIDER;
+      }
+    });
+
+    it('9.27 GET /api/ask/conversations/:id returns imagePrompt and imageSeed', async () => {
+      const conv = await Conversation.create({
+        user: genImgUser._id,
+        title: 'Test Stored Seed Conversation',
+        messages: [
+          { role: 'user', content: 'Draw a plant cell', mode: 'image' },
+          {
+            role: 'assistant',
+            content: 'Educational illustration for: Draw a plant cell',
+            mode: 'image',
+            generatedImage: true,
+            imagePrompt: 'Draw a plant cell',
+            imageSeed: 987654321,
+            keyParts: ['Cell Wall: Cellulose barrier', 'Vacuole: Central storage'],
+          },
+        ],
+      });
+
+      try {
+        const res = await request(server)
+          .get(`/api/ask/conversations/${conv._id}`)
+          .set('Authorization', authGenImgUser);
+
+        assert.equal(res.status, 200);
+        assert.ok(Array.isArray(res.body.messages));
+        assert.equal(res.body.messages.length, 2);
+        const assistantMsg = res.body.messages[1];
+        assert.equal(assistantMsg.imagePrompt, 'Draw a plant cell');
+        assert.equal(assistantMsg.imageSeed, 987654321);
+      } finally {
+        await Conversation.deleteOne({ _id: conv._id });
+      }
+    });
+
+    it('9.28 POST /api/ask regenerate reuses stored imagePrompt and imageSeed, ignores client prompt/seed overrides, and bytes never stored', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'cloudflare';
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+      const today = getKolkataDateString();
+
+      await AskUsage.deleteMany({ user: genImgUser._id, date: today });
+      await GlobalImageUsage.deleteMany({ date: today });
+
+      const storedPrompt = 'Draw mitochondria inner membrane';
+      const storedSeed = 42424242;
+
+      const conv = await Conversation.create({
+        user: genImgUser._id,
+        title: 'Mitochondria Chat',
+        messages: [
+          { role: 'user', content: storedPrompt, mode: 'image' },
+          {
+            role: 'assistant',
+            content: 'Educational illustration for: Draw mitochondria inner membrane',
+            mode: 'image',
+            generatedImage: true,
+            imagePrompt: storedPrompt,
+            imageSeed: storedSeed,
+            keyParts: ['Cristae: Infolded inner membrane folds'],
+          },
+        ],
+      });
+
+      const messageId = conv.messages[1]._id;
+
+      let capturedBody = null;
+      const fakePngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const mockFetch = mock.method(global, 'fetch', async (url, opts) => {
+        if (opts?.body) {
+          capturedBody = JSON.parse(opts.body);
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            result: { image: fakePngBase64 },
+          }),
+        };
+      });
+
+      try {
+        // Attempt regenerate while sending malicious prompt and seed overrides
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            regenerate: {
+              conversationId: conv._id,
+              messageId,
+            },
+            question: 'HACKED_CLIENT_QUESTION',
+            prompt: 'HACKED_CLIENT_PROMPT',
+            seed: 999999999,
+          });
+
+        assert.equal(res.status, 200);
+        assert.ok(res.body.image);
+        assert.equal(res.body.imagePrompt, storedPrompt);
+        assert.equal(res.body.imageSeed, storedSeed);
+
+        // Verify provider request body sent the EXACT stored prompt and seed, NOT client overrides
+        assert.ok(capturedBody);
+        assert.equal(capturedBody.seed, storedSeed, 'Must use stored imageSeed');
+        assert.notEqual(capturedBody.seed, 999999999, 'Must not trust client seed override');
+        assert.ok(capturedBody.prompt.includes('mitochondria inner membrane'), 'Must use stored imagePrompt');
+        assert.ok(!capturedBody.prompt.includes('HACKED'), 'Must not trust client prompt override');
+
+        // Verify bytes are never stored in MongoDB
+        const updatedConv = await Conversation.findById(conv._id);
+        const serialized = JSON.stringify(updatedConv.toObject());
+        assert.ok(!serialized.includes(fakePngBase64), 'Image base64 bytes must never be stored on regenerate');
+      } finally {
+        mockFetch.mock.restore();
+        await Conversation.deleteOne({ _id: conv._id });
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+        else delete process.env.IMAGE_PROVIDER;
+      }
+    });
+
+    it('9.29 regenerate returns 404 for another user\'s conversation or non-existent message', async () => {
+      // Create user B's conversation
+      const userB = await User.create({
+        name: 'User B',
+        email: `user_b_${Date.now()}@test.edu`,
+        password: 'password123',
+      });
+      const convB = await Conversation.create({
+        user: userB._id,
+        title: 'User B Private Image Chat',
+        messages: [
+          { role: 'user', content: 'Draw a nucleus', mode: 'image' },
+          {
+            role: 'assistant',
+            content: 'Illustration',
+            mode: 'image',
+            generatedImage: true,
+            imagePrompt: 'Draw a nucleus',
+            imageSeed: 111222,
+          },
+        ],
+      });
+
+      try {
+        // User A attempts to regenerate User B's conversation -> 404
+        const resOther = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            regenerate: {
+              conversationId: convB._id,
+              messageId: convB.messages[1]._id,
+            },
+          });
+
+        assert.equal(resOther.status, 404);
+        assert.match(resOther.body.message, /not found or does not belong to you/i);
+
+        // User B attempts to regenerate non-existent messageId in their own conversation -> 404
+        const authUserB = `Bearer ${jwt.sign({ id: userB._id }, getJwtSecret(), { expiresIn: '1h' })}`;
+        const resMissingMsg = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUserB)
+          .send({
+            regenerate: {
+              conversationId: convB._id,
+              messageId: new mongoose.Types.ObjectId(),
+            },
+          });
+
+        assert.equal(resMissingMsg.status, 404);
+        assert.match(resMissingMsg.body.message, /message not found/i);
+      } finally {
+        await Conversation.deleteOne({ _id: convB._id });
+        await User.deleteOne({ _id: userB._id });
+      }
+    });
+
+    it('9.30 regenerate daily cap (5 images) and slot refund on provider failure apply', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'cloudflare';
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+      const today = getKolkataDateString();
+
+      const conv = await Conversation.create({
+        user: genImgUser._id,
+        title: 'Cap Test Conversation',
+        messages: [
+          { role: 'user', content: 'Draw ribosome', mode: 'image' },
+          {
+            role: 'assistant',
+            content: 'Ribosome illustration',
+            mode: 'image',
+            generatedImage: true,
+            imagePrompt: 'Draw ribosome',
+            imageSeed: 55555,
+          },
+        ],
+      });
+
+      const messageId = conv.messages[1]._id;
+
+      try {
+        // 1. Set user imageCount to 5 -> regenerate returns 429
+        await AskUsage.findOneAndUpdate(
+          { user: genImgUser._id, date: today },
+          { count: 5, imageCount: 5 },
+          { upsert: true }
+        );
+
+        const resCapped = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            regenerate: {
+              conversationId: conv._id,
+              messageId,
+            },
+          });
+
+        assert.equal(resCapped.status, 429);
+        assert.match(resCapped.body.message, /Daily image generation limit reached/i);
+
+        // 2. Reset user imageCount to 0, simulate provider failure -> slot refunded
+        await AskUsage.findOneAndUpdate(
+          { user: genImgUser._id, date: today },
+          { count: 0, imageCount: 0 },
+          { upsert: true }
+        );
+        await GlobalImageUsage.deleteMany({ date: today });
+
+        const mockFetchFail = mock.method(global, 'fetch', async () => ({
+          ok: false,
+          status: 500,
+          json: async () => ({
+            errors: [{ code: 10009, message: 'Cloudflare Workers AI internal error' }],
+          }),
+        }));
+
+        try {
+          const resFail = await request(server)
+            .post('/api/ask')
+            .set('Authorization', authGenImgUser)
+            .send({
+              regenerate: {
+                conversationId: conv._id,
+                messageId,
+              },
+            });
+
+          assert.equal(resFail.status, 503);
+
+          // Verify slot was refunded: imageCount remains 0
+          const usageAfter = await AskUsage.findOne({ user: genImgUser._id, date: today });
+          assert.equal(usageAfter?.imageCount || 0, 0, 'imageCount must be refunded back to 0 on failure');
+
+          const globalUsageAfter = await GlobalImageUsage.findOne({ date: today });
+          assert.equal(globalUsageAfter?.count || 0, 0, 'Global image count must be refunded back to 0 on failure');
+        } finally {
+          mockFetchFail.mock.restore();
+        }
+      } finally {
+        await Conversation.deleteOne({ _id: conv._id });
+        await AskUsage.deleteMany({ user: genImgUser._id, date: today });
+        await GlobalImageUsage.deleteMany({ date: today });
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+        else delete process.env.IMAGE_PROVIDER;
+      }
+    });
   });
 });
+
