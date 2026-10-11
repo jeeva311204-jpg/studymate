@@ -6,7 +6,7 @@ const Conversation = require('../models/Conversation');
 const geminiConfig = require('../config/gemini');
 const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
 const { generateGeminiImage, ImageGenError } = require('../utils/geminiImage');
-const { generateCloudflareImage } = require('../utils/cloudflareImage');
+const { generateCloudflareImage, buildEducationalPrompt, stripTextAndLabelRequests, NO_TEXT_INSTRUCTION } = require('../utils/cloudflareImage');
 
 const ALLOWED_MODES = ['auto', 'doubt', 'mark2', 'mark8', 'mark16', 'short_notes', 'simple', 'svg', 'image'];
 
@@ -565,12 +565,14 @@ Diagram for ${q.slice(0, 40)}
         });
       }
 
+      const imagePrompt = stripTextAndLabelRequests(trimmedQuestion);
+
       let generatedResult;
       try {
         if (provider === 'cloudflare') {
-          generatedResult = await generateCloudflareImage(trimmedQuestion);
+          generatedResult = await generateCloudflareImage(imagePrompt);
         } else {
-          generatedResult = await generateGeminiImage(trimmedQuestion);
+          generatedResult = await generateGeminiImage(imagePrompt);
         }
       } catch (imgErr) {
         // Refund both reserved slots on failure
@@ -595,6 +597,34 @@ Diagram for ${q.slice(0, 40)}
         });
       }
 
+      // Generate key parts using the text model
+      let keyParts = [];
+      try {
+        const keyPartsPrompt = `You are StudyMate AI, an expert academic tutor.
+For the academic concept "${trimmedQuestion}", provide a concise list of 3 to 6 key parts, labels, or components that a student should know.
+Requirements:
+1. Return strictly 3 to 6 bullet points (using "- ").
+2. Each bullet point should concisely name a key part followed by a brief description.
+3. Return only the bullet points with no preamble, headings, or conclusion.`;
+
+        const rawKeyParts = await geminiConfig.generateWithModelFallback(keyPartsPrompt, {
+          generationConfig: { maxOutputTokens: 300 },
+        });
+
+        if (rawKeyParts && typeof rawKeyParts === 'string') {
+          keyParts = rawKeyParts
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => line.startsWith('*') || line.startsWith('-') || /^\d+[\.\)]/.test(line))
+            .map((line) => line.replace(/^[\*\-\d\.\)]+\s*/, '').trim())
+            .filter(Boolean)
+            .slice(0, 6);
+        }
+      } catch (keyPartsErr) {
+        console.error('[AskController] Key parts generation error:', keyPartsErr.message);
+        keyParts = [];
+      }
+
       // Persist messages to conversation (never store image base64 bytes)
       let savedConversationId = null;
       const userMessage = {
@@ -609,6 +639,7 @@ Diagram for ${q.slice(0, 40)}
         content: generatedResult.caption || `Generated educational illustration for: ${trimmedQuestion}`,
         mode: 'image',
         generatedImage: true,
+        keyParts: keyParts.length > 0 ? keyParts : undefined,
         hasImage: false,
         createdAt: new Date(),
       };
@@ -637,6 +668,7 @@ Diagram for ${q.slice(0, 40)}
         },
         caption: generatedResult.caption || `Educational illustration for: ${trimmedQuestion}`,
         answer: generatedResult.caption || `Educational illustration for: ${trimmedQuestion}`,
+        keyParts: keyParts.length > 0 ? keyParts : [],
         mode: 'image',
         resolvedMode: 'image',
         truncated: false,
@@ -1170,3 +1202,7 @@ exports.isImageGenerationRequest = isImageGenerationRequest;
 exports.isSvgDiagramRequest = isSvgDiagramRequest;
 exports.getImageProvider = getImageProvider;
 exports.MAX_STORED_SVG_BYTES = MAX_STORED_SVG_BYTES;
+exports.stripTextAndLabelRequests = stripTextAndLabelRequests;
+exports.NO_TEXT_INSTRUCTION = NO_TEXT_INSTRUCTION;
+exports.buildEducationalPrompt = buildEducationalPrompt;
+exports.buildImagePrompt = buildEducationalPrompt;

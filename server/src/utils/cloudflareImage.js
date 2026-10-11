@@ -5,11 +5,35 @@
 
 const { ImageGenError } = require('./geminiImage');
 
+const NO_TEXT_INSTRUCTION = 'Clean illustration, no text, no letters, no words, no labels, no captions, no watermark.';
+
+/**
+ * Strips any requests to "label" or "add text" from user prompt for image providers
+ */
+const stripTextAndLabelRequests = (text) => {
+  if (!text || typeof text !== 'string') return '';
+  const hasInstruction = text.includes(NO_TEXT_INSTRUCTION);
+  let cleaned = hasInstruction ? text.replace(NO_TEXT_INSTRUCTION, '').trim() : text;
+
+  return cleaned
+    .replace(/\b(?:please\s+)?(?:add|include|with)\s+(?:text(?:\s+labels?)?|labels?)\b/gi, '')
+    .replace(/\b(?:and\s+)?(?:label|add\s+text)(?:\s+(?:it|them|the\s+parts|all\s+parts|parts|everything))?\b/gi, '')
+    .replace(/\b(?:labelled|labeled|labelling|labeling)\b/gi, '')
+    .replace(/\b(?:labels?|add\s+text)\b/gi, '')
+    .replace(/\b(?:and|with|please)\s*$/gi, '')
+    .replace(/,\s*,/g, ',')
+    .replace(/,\s*$/g, '')
+    .replace(/^\s*,\s*/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+};
+
 /**
  * Wraps user input into an educational illustration prompt
  */
 const buildEducationalPrompt = (studentPrompt) => {
-  return `Create a clean educational illustration to explain the following concept: "${studentPrompt.trim()}". Requirements: Clear visual explanation, labelled where useful, no text-heavy output, strictly safe educational content.`;
+  const cleaned = stripTextAndLabelRequests(studentPrompt);
+  return `Create a clean educational illustration to explain the following concept: "${cleaned}". Requirements: Clear visual explanation, strictly safe educational content. ${NO_TEXT_INSTRUCTION}`;
 };
 
 /**
@@ -186,4 +210,6 @@ const generateCloudflareImage = async (prompt, options = {}) => {
 module.exports = {
   generateCloudflareImage,
   buildEducationalPrompt,
+  stripTextAndLabelRequests,
+  NO_TEXT_INSTRUCTION,
 };

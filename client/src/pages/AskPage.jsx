@@ -33,6 +33,7 @@ import {
   Code,
   Layers,
   RefreshCw,
+  ListChecks,
 } from 'lucide-react';
 
 const MODES = [
@@ -441,6 +442,7 @@ const AskPage = () => {
         caption: caption || '',
         description: description || '',
         note: note || '',
+        keyParts: res.data.keyParts || [],
         mode: actualResolvedMode,
         chosenMode: selectedMode,
         resolvedMode: actualResolvedMode,
@@ -974,6 +976,22 @@ const AskPage = () => {
                               </div>
                             </div>
                           )}
+
+                          {item.keyParts && Array.isArray(item.keyParts) && item.keyParts.length > 0 && (
+                            <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700/80 space-y-2 text-left">
+                              <h5 className="text-xs font-bold text-slate-900 dark:text-slate-100 flex items-center space-x-1.5">
+                                <ListChecks className="w-3.5 h-3.5 text-brand-600 dark:text-brand-400" />
+                                <span>Key parts:</span>
+                              </h5>
+                              <ul className="space-y-1 text-xs text-slate-700 dark:text-slate-300 list-disc list-inside">
+                                {item.keyParts.map((part, idx) => (
+                                  <li key={idx} className="leading-relaxed">
+                                    {part}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
                         </div>
                       ) : item.mode === 'svg' || item.svg ? (
                         <div className="space-y-4">
@@ -1319,6 +1337,12 @@ const AskPage = () => {
                       </option>
                     ))}
                   </select>
+                  {selectedMode === 'image' && (
+                    <p className="text-[11px] text-amber-600 dark:text-amber-400 font-medium flex items-center space-x-1 mt-1">
+                      <Info className="w-3.5 h-3.5 flex-shrink-0" />
+                      <span>Images can't contain correct text. For labelled diagrams choose Diagram (SVG).</span>
+                    </p>
+                  )}
                 </div>
 
                 <div className="space-y-1">

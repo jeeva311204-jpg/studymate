@@ -20,7 +20,7 @@ const Conversation = require('../models/Conversation');
 const geminiConfig = require('../config/gemini');
 const { getKolkataDateString, isImageGenerationRequest, isSvgDiagramRequest, getImageProvider, MAX_STORED_SVG_BYTES } = require('../controllers/askController');
 const { generateGeminiImage, ImageGenError } = require('../utils/geminiImage');
-const { generateCloudflareImage } = require('../utils/cloudflareImage');
+const { generateCloudflareImage, stripTextAndLabelRequests, NO_TEXT_INSTRUCTION } = require('../utils/cloudflareImage');
 const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
 
 process.env.PORT = '5001';
@@ -2068,8 +2068,10 @@ Simple triangle diagram
       let capturedOptions = null;
 
       const mockFetch = mock.method(global, 'fetch', async (url, options) => {
-        capturedUrl = url;
-        capturedOptions = options;
+        if (!capturedUrl || (url && url.includes('gemini-3.1-flash-lite-image'))) {
+          capturedUrl = url;
+          capturedOptions = options;
+        }
         return {
           ok: true,
           status: 200,
@@ -3250,6 +3252,138 @@ Diagram of the water cycle
         } else {
           delete process.env.IMAGE_PROVIDER;
         }
+      }
+    });
+
+    it('9.23 image provider request body includes appended no-text instruction and strips label/text requests', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+
+      // 1. Unit test stripTextAndLabelRequests
+      assert.equal(stripTextAndLabelRequests('draw a plant cell with labels and add text'), 'draw a plant cell');
+      assert.equal(stripTextAndLabelRequests('draw a cell, labelled'), 'draw a cell');
+      assert.equal(stripTextAndLabelRequests('draw mitochondria and label the parts'), 'draw mitochondria');
+
+      // 2. Integration with generateCloudflareImage: verify fetch body
+      let capturedBody = null;
+      const fakePngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const mockFetch = mock.method(global, 'fetch', async (url, opts) => {
+        if (opts?.body) {
+          capturedBody = JSON.parse(opts.body);
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            result: { image: fakePngBase64 },
+          }),
+        };
+      });
+
+      try {
+        const studentPrompt = 'Draw an animal cell with labels and add text';
+        const res = await generateCloudflareImage(studentPrompt);
+        assert.ok(res.image);
+        assert.ok(capturedBody, 'Cloudflare request body must be sent');
+        assert.equal(capturedBody.steps, 4);
+
+        // Verify no-text instruction appended
+        assert.ok(
+          capturedBody.prompt.includes('Clean illustration, no text, no letters, no words, no labels, no captions, no watermark.'),
+          'Prompt must contain appended no-text instruction'
+        );
+
+        // Verify label and add text requests stripped
+        assert.ok(!capturedBody.prompt.toLowerCase().includes('with labels'), 'Prompt must strip "with labels"');
+        assert.ok(!capturedBody.prompt.toLowerCase().includes('add text'), 'Prompt must strip "add text"');
+      } finally {
+        mockFetch.mock.restore();
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+      }
+    });
+
+    it('9.24 POST /api/ask with mode image returns keyParts (3-6 bullet points) from text model and persists them', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'cloudflare';
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+      const today = getKolkataDateString();
+
+      await AskUsage.deleteMany({ user: genImgUser._id, date: today });
+      await GlobalImageUsage.deleteMany({ date: today });
+
+      let capturedImageBody = null;
+      const fakePngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const mockFetch = mock.method(global, 'fetch', async (url, opts) => {
+        if (opts?.body) {
+          capturedImageBody = JSON.parse(opts.body);
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            result: { image: fakePngBase64 },
+          }),
+        };
+      });
+
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => `- Nucleus: Controls genetic expression and cell division
+- Mitochondria: Performs cellular respiration generating ATP
+- Ribosomes: Protein synthesizers in the cytoplasm
+- Endoplasmic Reticulum: Folded membranes facilitating transport`
+      );
+
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'draw an animal cell with labels',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.mode, 'image');
+        assert.ok(res.body.image);
+        assert.ok(Array.isArray(res.body.keyParts));
+        assert.equal(res.body.keyParts.length, 4);
+        assert.match(res.body.keyParts[0], /Nucleus/i);
+        assert.match(res.body.keyParts[1], /Mitochondria/i);
+
+        // Verify Cloudflare request body had the no-text instruction and stripped "with labels"
+        assert.ok(capturedImageBody);
+        assert.ok(capturedImageBody.prompt.includes('Clean illustration, no text, no letters, no words, no labels, no captions, no watermark.'));
+        assert.ok(!capturedImageBody.prompt.toLowerCase().includes('with labels'));
+
+        // Verify conversation persistence
+        const conv = await Conversation.findById(res.body.conversationId);
+        assert.ok(conv);
+        assert.equal(conv.messages.length, 2);
+        const assistantMsg = conv.messages[1];
+        assert.equal(assistantMsg.mode, 'image');
+        assert.ok(Array.isArray(assistantMsg.keyParts));
+        assert.equal(assistantMsg.keyParts.length, 4);
+      } finally {
+        mockFetch.mock.restore();
+        mockFallback.mock.restore();
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+        else delete process.env.IMAGE_PROVIDER;
       }
     });
   });
