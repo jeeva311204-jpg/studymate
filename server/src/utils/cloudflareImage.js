@@ -39,7 +39,7 @@ const generateCloudflareImage = async (prompt, options = {}) => {
 
   const requestBody = {
     prompt: educationalPrompt,
-    num_steps: 4,
+    steps: 4,
   };
 
   let response;
@@ -55,7 +55,10 @@ const generateCloudflareImage = async (prompt, options = {}) => {
     });
   } catch (err) {
     clearTimeout(timeoutId);
-    if (err.name === 'AbortError' || controller.signal.aborted) {
+    const isTimeout = err.name === 'AbortError' || controller.signal.aborted;
+    const errorDetails = [{ code: isTimeout ? 'timeout' : 'network_error', message: err.message }];
+    console.error('[ImageGen] cloudflare failed', isTimeout ? 504 : 503, errorDetails);
+    if (isTimeout) {
       throw new ImageGenError('Image generation timed out after 60 seconds.', 'timeout', 503);
     }
     throw new ImageGenError(
@@ -76,17 +79,34 @@ const generateCloudflareImage = async (prompt, options = {}) => {
     }
 
     const status = response.status;
-    const errors = errorData.errors || [];
+    const rawErrors = Array.isArray(errorData?.errors) ? errorData.errors : [];
+    const errors =
+      rawErrors.length > 0
+        ? rawErrors.map((e) => ({
+            code: e.code,
+            message: typeof e.message === 'string' ? e.message : String(e.message || ''),
+          }))
+        : [{ code: status, message: response.statusText || 'Unknown error' }];
+
+    console.error('[ImageGen] cloudflare failed', status, errors);
+
     const firstMsg = (errors[0]?.message || '').toLowerCase();
 
     if (status === 429 || firstMsg.includes('quota') || firstMsg.includes('rate limit')) {
       throw new ImageGenError('Image generation quota exceeded. Please try again later.', 'quota', 429);
     }
 
-    if (status === 400 && (firstMsg.includes('safety') || firstMsg.includes('harm') || firstMsg.includes('blocked'))) {
+    if (status === 400) {
+      if (firstMsg.includes('safety') || firstMsg.includes('harm') || firstMsg.includes('blocked')) {
+        throw new ImageGenError(
+          'Image generation was blocked by safety filters. Only safe educational illustrations are allowed.',
+          'safety',
+          400
+        );
+      }
       throw new ImageGenError(
-        'Image generation was blocked by safety filters. Only safe educational illustrations are allowed.',
-        'safety',
+        'Image generation request was invalid. Please try a different prompt.',
+        'bad_request',
         400
       );
     }
@@ -99,6 +119,14 @@ const generateCloudflareImage = async (prompt, options = {}) => {
       );
     }
 
+    if (status === 404 || firstMsg.includes('not found')) {
+      throw new ImageGenError(
+        'The configured image generation model is not available.',
+        'model',
+        503
+      );
+    }
+
     throw new ImageGenError(
       'Image generation service returned an upstream error. Please try again later.',
       'upstream',
@@ -106,28 +134,42 @@ const generateCloudflareImage = async (prompt, options = {}) => {
     );
   }
 
-  const contentType = response.headers.get('content-type') || '';
-  let base64Data = '';
+  let data;
+  try {
+    data = await response.json();
+  } catch (parseErr) {
+    console.error('[ImageGen] cloudflare failed', response.status, [
+      { code: 'json_parse_error', message: parseErr.message },
+    ]);
+    throw new ImageGenError('Image generation failed: model did not return a valid response.', 'upstream', 502);
+  }
+
+  const base64Image = data?.result?.image;
+  if (!base64Image || typeof base64Image !== 'string' || !base64Image.trim()) {
+    console.error('[ImageGen] cloudflare failed', response.status, [
+      { code: 'empty_image', message: 'Result image is empty or missing' },
+    ]);
+    throw new ImageGenError('Image generation failed: model did not return an image.', 'no_image', 502);
+  }
+
+  const imageBuffer = Buffer.from(base64Image.trim(), 'base64');
   let mimeType = 'image/jpeg';
 
-  if (contentType.includes('application/json')) {
-    const data = await response.json();
-    if (data.result && data.result.image) {
-      base64Data = data.result.image;
-    } else {
-      throw new ImageGenError('Image generation failed: model did not return an image.', 'no_image', 502);
-    }
-  } else {
-    const arrayBuffer = await response.arrayBuffer();
-    if (!arrayBuffer || arrayBuffer.byteLength === 0) {
-      throw new ImageGenError('Image generation failed: model did not return an image.', 'no_image', 502);
-    }
-    base64Data = Buffer.from(arrayBuffer).toString('base64');
-    if (contentType.includes('image/png')) {
-      mimeType = 'image/png';
-    } else if (contentType.includes('image/webp')) {
-      mimeType = 'image/webp';
-    }
+  if (
+    imageBuffer.length >= 4 &&
+    imageBuffer[0] === 0x89 &&
+    imageBuffer[1] === 0x50 &&
+    imageBuffer[2] === 0x4e &&
+    imageBuffer[3] === 0x47
+  ) {
+    mimeType = 'image/png';
+  } else if (
+    imageBuffer.length >= 3 &&
+    imageBuffer[0] === 0xff &&
+    imageBuffer[1] === 0xd8 &&
+    imageBuffer[2] === 0xff
+  ) {
+    mimeType = 'image/jpeg';
   }
 
   const caption = `Educational illustration for: ${prompt.trim()}`.slice(0, 300);
@@ -135,7 +177,7 @@ const generateCloudflareImage = async (prompt, options = {}) => {
   return {
     image: {
       mimeType,
-      data: base64Data,
+      data: base64Image.trim(),
     },
     caption,
   };

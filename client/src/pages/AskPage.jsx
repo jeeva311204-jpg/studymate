@@ -398,6 +398,10 @@ const AskPage = () => {
           mode: selectedMode,
         };
 
+        if (selectedMode === 'image') {
+          payload.fallback = true;
+        }
+
         if (selectedNoteId) {
           payload.noteId = selectedNoteId;
         }
@@ -409,7 +413,7 @@ const AskPage = () => {
         res = await api.post('/ask', payload, requestConfig);
       }
 
-      const { answer, svg, description, image, caption, mode, resolvedMode, truncated, conversationId } = res.data;
+      const { answer, svg, description, image, caption, mode, resolvedMode, truncated, conversationId, note } = res.data;
 
       // Update active conversation ID if newly created
       const effectiveQuestion = trimmed || DEFAULT_IMAGE_QUESTION;
@@ -436,6 +440,7 @@ const AskPage = () => {
         image: image || null,
         caption: caption || '',
         description: description || '',
+        note: note || '',
         mode: actualResolvedMode,
         chosenMode: selectedMode,
         resolvedMode: actualResolvedMode,
@@ -979,6 +984,13 @@ const AskPage = () => {
                               className="max-w-full max-h-[500px] object-contain rounded-xl select-none"
                             />
                           </div>
+
+                          {item.note && (
+                            <div className="flex items-center space-x-2 p-2.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-200 text-xs">
+                              <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-500" />
+                              <span>{item.note}</span>
+                            </div>
+                          )}
 
                           {item.description && (
                             <p className="text-xs text-slate-600 dark:text-slate-300 font-medium leading-relaxed">

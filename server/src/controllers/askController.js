@@ -296,7 +296,7 @@ exports.askQuestion = async (req, res) => {
     }
 
     // Helper for falling back to SVG diagram
-    const handleSvgFallback = async (q, userReq, userRes, fallbackDate, conv, origMode) => {
+    const handleSvgFallback = async (q, userReq, userRes, fallbackDate, conv, origMode, note = '') => {
       try {
         await AskUsage.findOneAndUpdate(
           { user: userReq.user._id, date: fallbackDate, count: { $lt: DAILY_ASK_LIMIT } },
@@ -372,6 +372,7 @@ Diagram for ${q.slice(0, 40)}
         description: desc,
         mode: 'svg',
         hasImage: false,
+        note: note || null,
         createdAt: new Date(),
       };
 
@@ -392,7 +393,7 @@ Diagram for ${q.slice(0, 40)}
         savedId = newConv._id;
       }
 
-      return userRes.status(200).json({
+      const responsePayload = {
         svg: cleanSvg,
         description: desc,
         answer: cleanSvg,
@@ -400,7 +401,12 @@ Diagram for ${q.slice(0, 40)}
         resolvedMode: 'svg',
         fallback: true,
         conversationId: savedId,
-      });
+      };
+      if (note) {
+        responsePayload.note = note;
+      }
+
+      return userRes.status(200).json(responsePayload);
     };
 
     // 5.5 Auto mode routing & Image Mode handling
@@ -462,12 +468,12 @@ Diagram for ${q.slice(0, 40)}
 
     if (effectiveMode === 'image') {
       const provider = getImageProvider();
-      const shouldFallback = (mode === 'auto') || Boolean(req.body.fallback || req.body.fallbackToSvg);
+      const shouldFallback = (mode === 'auto') || (effectiveMode === 'image' && (provider === 'cloudflare' || Boolean(req.body.fallback || req.body.fallbackToSvg)));
 
       if (provider === 'none') {
         if (shouldFallback) {
           today = getKolkataDateString();
-          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode);
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, 'Image service is busy, here is a diagram instead.');
         }
         return res.status(503).json({
           error: true,
@@ -500,7 +506,7 @@ Diagram for ${q.slice(0, 40)}
 
       if (!reservedGlobal) {
         if (shouldFallback) {
-          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode);
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, 'Image service is busy, here is a diagram instead.');
         }
         return res.status(429).json({
           error: true,
@@ -543,7 +549,7 @@ Diagram for ${q.slice(0, 40)}
         await GlobalImageUsage.updateOne({ date: today }, { $inc: { count: -1 } }).catch(() => {});
 
         if (shouldFallback) {
-          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode);
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, 'Image service is busy, here is a diagram instead.');
         }
 
         const usage = await AskUsage.findOne({ user: req.user._id, date: today });
@@ -578,7 +584,8 @@ Diagram for ${q.slice(0, 40)}
         ).catch(() => {});
 
         if (shouldFallback) {
-          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode);
+          const fallbackNote = 'Image service is busy, here is a diagram instead.';
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, fallbackNote);
         }
 
         const statusCode = imgErr.status || 503;

@@ -2697,48 +2697,160 @@ Flowchart of algorithms
       }
     });
 
-    it('9.17 Cloudflare image generation REST client succeeds with base64 and maps errors', async () => {
+    it('9.17 Cloudflare image generation REST client: success, 401, 403, 404, 400, timeout, empty result.image', async () => {
       const origAccount = process.env.CF_ACCOUNT_ID;
       const origToken = process.env.CF_API_TOKEN;
       process.env.CF_ACCOUNT_ID = 'cf-test-account-id';
       process.env.CF_API_TOKEN = 'cf-test-token-xyz';
 
-      // 1. Success case: returns image/png with base64 data
-      const fakeImageBytes = Buffer.from('fake-cloudflare-flux-image-bytes');
+      // 1. Success case: returns image/png or image/jpeg decoded from base64 with magic bytes detection
+      const fakePngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02, 0x03]);
+      const fakePngBase64 = fakePngBytes.toString('base64');
       let capturedUrl = '';
-      let capturedHeaders = {};
-      const mockFetchSuccess = mock.method(global, 'fetch', async (url, options) => {
+      let capturedOptions = null;
+
+      let mockFetch = mock.method(global, 'fetch', async (url, options) => {
         capturedUrl = url;
-        capturedHeaders = options.headers;
+        capturedOptions = options;
         return {
           ok: true,
           status: 200,
-          headers: { get: () => 'image/png' },
-          arrayBuffer: async () => fakeImageBytes.buffer.slice(fakeImageBytes.byteOffset, fakeImageBytes.byteOffset + fakeImageBytes.byteLength),
+          json: async () => ({
+            success: true,
+            result: { image: fakePngBase64 },
+          }),
         };
       });
 
       try {
         const result = await generateCloudflareImage('Draw a picture of an atom');
         assert.equal(result.image.mimeType, 'image/png');
-        assert.equal(result.image.data, fakeImageBytes.toString('base64'));
+        assert.equal(result.image.data, fakePngBase64);
         assert.ok(result.caption);
-        assert.match(capturedUrl, /@cf\/black-forest-labs\/flux-1-schnell/);
-        assert.match(capturedHeaders['Authorization'], /Bearer cf-test-token-xyz/);
+        assert.match(capturedUrl, /accounts\/cf-test-account-id\/ai\/run\/@cf\/black-forest-labs\/flux-1-schnell/);
+        assert.equal(capturedOptions.method, 'POST');
+        assert.equal(capturedOptions.headers['Content-Type'], 'application/json');
+        assert.equal(capturedOptions.headers['Authorization'], 'Bearer cf-test-token-xyz');
+        const parsedBody = JSON.parse(capturedOptions.body);
+        assert.equal(parsedBody.steps, 4);
+        assert.match(parsedBody.prompt, /Draw a picture of an atom/);
       } finally {
-        mockFetchSuccess.mock.restore();
+        mockFetch.mock.restore();
       }
 
-      // 2. Unsafe/blocked content error: returns 400 ImageGenError
-      const mockFetchSafety = mock.method(global, 'fetch', async () => ({
-        ok: false,
-        status: 400,
-        headers: { get: () => 'application/json' },
-        json: async () => ({ errors: [{ message: 'Prompt was flagged by safety filter' }] }),
-        text: async () => JSON.stringify({ errors: [{ message: 'Prompt was flagged by safety filter' }] }),
+      // 1b. Success case with JPEG magic bytes (FF D8 FF)
+      const fakeJpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+      const fakeJpegBase64 = fakeJpegBytes.toString('base64');
+      mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          success: true,
+          result: { image: fakeJpegBase64 },
+        }),
       }));
 
       try {
+        const resultJpeg = await generateCloudflareImage('Draw a picture of a cell');
+        assert.equal(resultJpeg.image.mimeType, 'image/jpeg');
+        assert.equal(resultJpeg.image.data, fakeJpegBase64);
+      } finally {
+        mockFetch.mock.restore();
+      }
+
+      // Spy on console.error for error cases
+      let loggedCalls = [];
+      const mockConsoleError = mock.method(console, 'error', (...args) => {
+        loggedCalls.push(args);
+      });
+
+      try {
+        // 2. 401 Unauthorized
+        loggedCalls = [];
+        mockFetch = mock.method(global, 'fetch', async () => ({
+          ok: false,
+          status: 401,
+          json: async () => ({
+            errors: [{ code: 10000, message: 'Authentication error: Invalid API token' }],
+          }),
+        }));
+
+        await assert.rejects(
+          async () => generateCloudflareImage('Cell biology diagram'),
+          (err) => {
+            assert.equal(err.status, 503);
+            assert.match(err.message, /unavailable.*or requires billing/i);
+            return true;
+          }
+        );
+        mockFetch.mock.restore();
+
+        assert.equal(loggedCalls.length, 1);
+        assert.equal(loggedCalls[0][0], '[ImageGen] cloudflare failed');
+        assert.equal(loggedCalls[0][1], 401);
+        assert.deepEqual(loggedCalls[0][2], [{ code: 10000, message: 'Authentication error: Invalid API token' }]);
+        assert.ok(!JSON.stringify(loggedCalls[0]).includes('cf-test-token-xyz'), 'Never log token');
+
+        // 3. 403 Forbidden
+        loggedCalls = [];
+        mockFetch = mock.method(global, 'fetch', async () => ({
+          ok: false,
+          status: 403,
+          json: async () => ({
+            errors: [{ code: 10001, message: 'Forbidden: Worker does not have AI permissions' }],
+          }),
+        }));
+
+        await assert.rejects(
+          async () => generateCloudflareImage('Mitochondria structure'),
+          (err) => {
+            assert.equal(err.status, 503);
+            assert.match(err.message, /unavailable.*or requires billing/i);
+            return true;
+          }
+        );
+        mockFetch.mock.restore();
+
+        assert.equal(loggedCalls.length, 1);
+        assert.equal(loggedCalls[0][0], '[ImageGen] cloudflare failed');
+        assert.equal(loggedCalls[0][1], 403);
+        assert.deepEqual(loggedCalls[0][2], [{ code: 10001, message: 'Forbidden: Worker does not have AI permissions' }]);
+
+        // 4. 404 Not Found (e.g. invalid model or account)
+        loggedCalls = [];
+        mockFetch = mock.method(global, 'fetch', async () => ({
+          ok: false,
+          status: 404,
+          json: async () => ({
+            errors: [{ code: 7000, message: 'No route for that model' }],
+          }),
+        }));
+
+        await assert.rejects(
+          async () => generateCloudflareImage('Photosynthesis stages'),
+          (err) => {
+            assert.equal(err.status, 503);
+            assert.match(err.message, /model is not available/i);
+            return true;
+          }
+        );
+        mockFetch.mock.restore();
+
+        assert.equal(loggedCalls.length, 1);
+        assert.equal(loggedCalls[0][0], '[ImageGen] cloudflare failed');
+        assert.equal(loggedCalls[0][1], 404);
+        assert.deepEqual(loggedCalls[0][2], [{ code: 7000, message: 'No route for that model' }]);
+
+        // 5. 400 Bad Request: (a) safety filter block, (b) invalid request
+        loggedCalls = [];
+        mockFetch = mock.method(global, 'fetch', async () => ({
+          ok: false,
+          status: 400,
+          json: async () => ({
+            errors: [{ code: 10002, message: 'Prompt was flagged by safety filter' }],
+          }),
+        }));
+
         await assert.rejects(
           async () => generateCloudflareImage('Unsafe topic prompt'),
           (err) => {
@@ -2747,24 +2859,103 @@ Flowchart of algorithms
             return true;
           }
         );
+        mockFetch.mock.restore();
+
+        assert.equal(loggedCalls.length, 1);
+        assert.equal(loggedCalls[0][0], '[ImageGen] cloudflare failed');
+        assert.equal(loggedCalls[0][1], 400);
+
+        loggedCalls = [];
+        mockFetch = mock.method(global, 'fetch', async () => ({
+          ok: false,
+          status: 400,
+          json: async () => ({
+            errors: [{ code: 10003, message: 'Invalid parameter: prompt too long' }],
+          }),
+        }));
+
+        await assert.rejects(
+          async () => generateCloudflareImage('Invalid prompt parameter'),
+          (err) => {
+            assert.equal(err.status, 400);
+            assert.match(err.message, /invalid/i);
+            return true;
+          }
+        );
+        mockFetch.mock.restore();
+
+        assert.equal(loggedCalls.length, 1);
+        assert.equal(loggedCalls[0][0], '[ImageGen] cloudflare failed');
+        assert.equal(loggedCalls[0][1], 400);
+
+        // 6. Timeout (AbortError)
+        loggedCalls = [];
+        mockFetch = mock.method(global, 'fetch', async () => {
+          const timeoutErr = new Error('The operation was aborted');
+          timeoutErr.name = 'AbortError';
+          throw timeoutErr;
+        });
+
+        await assert.rejects(
+          async () => generateCloudflareImage('Long running image prompt'),
+          (err) => {
+            assert.equal(err.status, 503);
+            assert.match(err.message, /timed out after 60 seconds/i);
+            return true;
+          }
+        );
+        mockFetch.mock.restore();
+
+        assert.equal(loggedCalls.length, 1);
+        assert.equal(loggedCalls[0][0], '[ImageGen] cloudflare failed');
+
+        // 7. Empty result.image
+        loggedCalls = [];
+        mockFetch = mock.method(global, 'fetch', async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            success: true,
+            result: { image: '' },
+          }),
+        }));
+
+        await assert.rejects(
+          async () => generateCloudflareImage('Prompt with empty image response'),
+          (err) => {
+            assert.equal(err.status, 502);
+            assert.match(err.message, /did not return an image/i);
+            return true;
+          }
+        );
+        mockFetch.mock.restore();
+
+        assert.equal(loggedCalls.length, 1);
+        assert.equal(loggedCalls[0][0], '[ImageGen] cloudflare failed');
+
+        // 8. Missing credentials
+        delete process.env.CF_ACCOUNT_ID;
+        await assert.rejects(
+          async () => generateCloudflareImage('Draw a cell'),
+          (err) => {
+            assert.equal(err.status, 503);
+            assert.match(err.message, /not configured/i);
+            return true;
+          }
+        );
       } finally {
-        mockFetchSafety.mock.restore();
-      }
-
-      // 3. Credentials missing throws 503 ImageGenError
-      delete process.env.CF_ACCOUNT_ID;
-      await assert.rejects(
-        async () => generateCloudflareImage('Draw a cell'),
-        (err) => {
-          assert.equal(err.status, 503);
-          assert.match(err.message, /not configured/i);
-          return true;
+        mockConsoleError.mock.restore();
+        if (origAccount) {
+          process.env.CF_ACCOUNT_ID = origAccount;
+        } else {
+          delete process.env.CF_ACCOUNT_ID;
         }
-      );
-
-      // Restore credentials
-      if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
-      if (origToken) process.env.CF_API_TOKEN = origToken;
+        if (origToken) {
+          process.env.CF_API_TOKEN = origToken;
+        } else {
+          delete process.env.CF_API_TOKEN;
+        }
+      }
     });
 
     it('9.18 fallback to SVG diagram and refund slot on image provider failure', async () => {
@@ -2968,6 +3159,97 @@ Fallback Diagram of Water Molecule
         await AskUsage.deleteMany({ user: parallelUser._id });
         await GlobalImageUsage.deleteMany({ date: today });
         await User.deleteOne({ _id: parallelUser._id });
+      }
+    });
+
+    it('9.22 in Generate Image mode, if provider fails, refunds slot and returns SVG diagram with note', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'cloudflare';
+      process.env.CF_ACCOUNT_ID = 'cf-test-account-id';
+      process.env.CF_API_TOKEN = 'cf-test-token-xyz';
+      const today = getKolkataDateString();
+
+      // Ensure fresh usage
+      await AskUsage.deleteMany({ user: genImgUser._id, date: today });
+      await GlobalImageUsage.deleteMany({ date: today });
+
+      // Stub Cloudflare fetch to simulate upstream failure (e.g. 500)
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: false,
+        status: 500,
+        json: async () => ({
+          errors: [{ code: 10009, message: 'Internal Cloudflare AI server error' }],
+        }),
+      }));
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => `=== DESCRIPTION ===
+Diagram of the water cycle
+=== SVG ===
+<svg viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg"><rect width="400" height="200" fill="#e0f2fe"/><text x="200" y="100" text-anchor="middle" font-size="16" fill="#0369a1">Water Cycle Diagram</text></svg>`
+      );
+
+      try {
+        const usageBefore = await AskUsage.findOne({ user: genImgUser._id, date: today });
+        assert.equal(usageBefore?.imageCount || 0, 0);
+
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'generate an image of the water cycle',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 200, 'Must return 200 instead of 503');
+        assert.equal(res.body.mode, 'svg');
+        assert.equal(res.body.resolvedMode, 'svg');
+        assert.ok(res.body.svg);
+        assert.match(res.body.svg, /<svg/i);
+        assert.equal(res.body.fallback, true);
+        assert.equal(res.body.note, 'Image service is busy, here is a diagram instead.');
+        assert.ok(res.body.conversationId);
+
+        // Verify slot was refunded: imageCount must be 0
+        const usageAfter = await AskUsage.findOne({ user: genImgUser._id, date: today });
+        assert.equal(usageAfter?.imageCount || 0, 0, 'imageCount must be refunded back to 0');
+        // Normal ask count was recorded for the SVG diagram
+        assert.equal(usageAfter?.count || 0, 1, 'Standard ask count should be 1');
+
+        // Verify GlobalImageUsage count was also refunded
+        const globalUsage = await GlobalImageUsage.findOne({ date: today });
+        assert.equal(globalUsage?.count || 0, 0, 'Global image count must be refunded back to 0');
+
+        // Verify conversation history
+        const conv = await Conversation.findById(res.body.conversationId);
+        assert.ok(conv);
+        assert.equal(conv.messages.length, 2);
+        assert.equal(conv.messages[1].mode, 'svg');
+        assert.ok(conv.messages[1].svg);
+      } finally {
+        mockFetch.mock.restore();
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+        if (origAccount) {
+          process.env.CF_ACCOUNT_ID = origAccount;
+        } else {
+          delete process.env.CF_ACCOUNT_ID;
+        }
+        if (origToken) {
+          process.env.CF_API_TOKEN = origToken;
+        } else {
+          delete process.env.CF_API_TOKEN;
+        }
+        if (origProvider) {
+          process.env.IMAGE_PROVIDER = origProvider;
+        } else {
+          delete process.env.IMAGE_PROVIDER;
+        }
       }
     });
   });
