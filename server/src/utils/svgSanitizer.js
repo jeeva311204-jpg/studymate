@@ -35,11 +35,18 @@ function sanitizeSvg(rawSvg) {
   svgContent = svgContent.replace(/<iframe[\s\S]*?<\/iframe>/gi, '');
   svgContent = svgContent.replace(/<iframe[^>]*\/>/gi, '');
 
+  // Strip <image> and <img> tags and their inner content
+  svgContent = svgContent.replace(/<image[\s\S]*?<\/image>/gi, '');
+  svgContent = svgContent.replace(/<image[^>]*\/>/gi, '');
+  svgContent = svgContent.replace(/<img[\s\S]*?<\/img>/gi, '');
+  svgContent = svgContent.replace(/<img[^>]*\/>/gi, '');
+
   // Remove <style> tags that contain @import, external url(...) references, or javascript:
   svgContent = svgContent.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (match, cssBody) => {
     if (
       /@import/i.test(cssBody) ||
-      /url\s*\(\s*['"]?(?:https?:|\/\/|javascript:|data:)/i.test(cssBody)
+      /url\s*\(\s*['"]?(?!#[a-zA-Z0-9_\-]+['"]?\s*\))/i.test(cssBody) ||
+      /javascript:/i.test(cssBody)
     ) {
       return '';
     }
@@ -73,7 +80,7 @@ function sanitizeSvg(rawSvg) {
       'use',
       'a',
     ],
-    nonTextTags: ['style', 'script', 'textarea', 'option', 'noscript', 'foreignObject', 'iframe'],
+    nonTextTags: ['style', 'script', 'textarea', 'option', 'noscript', 'foreignObject', 'iframe', 'image', 'img'],
     disallowedTagsMode: 'discard',
     allowVulnerableTags: true,
     allowedAttributes: {
@@ -125,13 +132,24 @@ function sanitizeSvg(rawSvg) {
         'marker-mid',
         'marker-end',
         'markerWidth',
+        'markerwidth',
         'markerHeight',
+        'markerheight',
         'refX',
+        'refx',
         'refY',
+        'refy',
         'orient',
         'gradientUnits',
+        'gradientunits',
+        'gradientTransform',
+        'gradienttransform',
+        'preserveAspectRatio',
+        'preserveaspectratio',
         'patternUnits',
+        'patternunits',
         'clip-path',
+        'clipPath',
         'mask',
         'href',
         'xlink:href',
@@ -162,6 +180,31 @@ function sanitizeSvg(rawSvg) {
           }
         }
 
+        // In style attributes, strip any url() that is not url(#id)
+        if (attribs.style) {
+          attribs.style = attribs.style.replace(/url\s*\(\s*(['"]?)(.*?)\1\s*\)/gi, (match, quote, target) => {
+            const trimmed = target.trim();
+            if (/^#[a-zA-Z0-9_\-]+$/.test(trimmed)) {
+              return `url(${trimmed})`;
+            }
+            return '';
+          });
+        }
+
+        // Drop empty <use> tags that have no valid href or xlink:href
+        if (tagName === 'use') {
+          if (!attribs.href && !attribs['xlink:href']) {
+            return false;
+          }
+        }
+
+        // Drop attribute-less <a> tags (unwraps text content)
+        if (tagName === 'a') {
+          if (Object.keys(attribs).length === 0) {
+            return false;
+          }
+        }
+
         return { tagName, attribs };
       },
     },
@@ -173,7 +216,35 @@ function sanitizeSvg(rawSvg) {
     return { svg: null, isOversized: false };
   }
 
-  const finalSvg = finalMatch[0].trim();
+  let finalSvg = finalMatch[0].trim();
+
+  // Post-processing cleanup: drop empty <use> and attribute-less <a>
+  finalSvg = finalSvg.replace(/<use(?:\s+[^>]*)?(?:\/>|>\s*<\/use>)/gi, (match) => {
+    if (!match.includes('href=') && !match.includes('xlink:href=')) {
+      return '';
+    }
+    return match;
+  });
+  finalSvg = finalSvg.replace(/<a\s*>([\s\S]*?)<\/a>/gi, '$1');
+  finalSvg = finalSvg.replace(/<a\s*\/>/gi, '');
+
+  // Preserve casing for SVG XML attributes that sanitizeHtml lowercases
+  const SVG_CAMEL_CASE_MAP = {
+    viewbox: 'viewBox',
+    markerwidth: 'markerWidth',
+    markerheight: 'markerHeight',
+    refx: 'refX',
+    refy: 'refY',
+    gradientunits: 'gradientUnits',
+    gradienttransform: 'gradientTransform',
+    preserveaspectratio: 'preserveAspectRatio',
+    patternunits: 'patternUnits',
+    clippath: 'clipPath',
+  };
+
+  for (const [lower, camel] of Object.entries(SVG_CAMEL_CASE_MAP)) {
+    finalSvg = finalSvg.replace(new RegExp(`\\b${lower}(?==)`, 'gi'), camel);
+  }
 
   // Final check on sanitized byte length
   if (Buffer.byteLength(finalSvg, 'utf8') > MAX_SVG_BYTES) {

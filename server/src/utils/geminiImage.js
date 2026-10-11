@@ -36,7 +36,7 @@ const generateGeminiImage = async (prompt, options = {}) => {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'your_gemini_api_key_here') {
     throw new ImageGenError(
-      'Ask AI service is unavailable: GEMINI_API_KEY is not configured in server/.env.',
+      'AI service is temporarily unavailable. Please try again in a minute.',
       'no_key',
       503
     );
@@ -104,7 +104,7 @@ const generateGeminiImage = async (prompt, options = {}) => {
 
     if (status === 404 || rawMsg.includes('not found')) {
       throw new ImageGenError(
-        'The configured image generation model is not available. Please verify GEMINI_IMAGE_MODEL.',
+        'The configured image generation model is not available.',
         'model',
         503
       );
@@ -126,7 +126,7 @@ const generateGeminiImage = async (prompt, options = {}) => {
       rawMsg.includes('not supported')
     ) {
       throw new ImageGenError(
-        'Image generation is not available on this API key or requires billing permissions.',
+        'Image generation service is not available or requires billing permissions.',
         'not_allowed',
         503
       );

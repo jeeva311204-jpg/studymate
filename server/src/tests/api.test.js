@@ -15,10 +15,12 @@ const User = require('../models/User');
 const Note = require('../models/Note');
 const QuizResult = require('../models/QuizResult');
 const AskUsage = require('../models/AskUsage');
+const GlobalImageUsage = require('../models/GlobalImageUsage');
 const Conversation = require('../models/Conversation');
 const geminiConfig = require('../config/gemini');
-const { getKolkataDateString, isImageGenerationRequest, isSvgDiagramRequest } = require('../controllers/askController');
+const { getKolkataDateString, isImageGenerationRequest, isSvgDiagramRequest, getImageProvider, MAX_STORED_SVG_BYTES } = require('../controllers/askController');
 const { generateGeminiImage, ImageGenError } = require('../utils/geminiImage');
+const { generateCloudflareImage } = require('../utils/cloudflareImage');
 const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
 
 process.env.PORT = '5001';
@@ -670,7 +672,7 @@ describe('StudyMate API', () => {
       assert.match(res.body.message, /not found or does not belong to you/i);
     });
 
-    it('5.8 returns 503 when GEMINI_API_KEY is missing (mock helper)', async () => {
+    it('5.8 returns 503 when AI client is missing without leaking GEMINI_API_KEY', async () => {
       const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => null);
       try {
         const res = await request(server)
@@ -678,7 +680,8 @@ describe('StudyMate API', () => {
           .set('Authorization', authUser1)
           .send({ question: 'What is process synchronization?', mode: 'doubt' });
         assert.equal(res.status, 503);
-        assert.match(res.body.message, /GEMINI_API_KEY is not configured/i);
+        assert.match(res.body.message, /AI service is temporarily unavailable/i);
+        assert.doesNotMatch(res.body.message, /GEMINI_API_KEY/i);
       } finally {
         mockGetClient.mock.restore();
       }
@@ -1638,6 +1641,92 @@ describe('StudyMate API', () => {
         assert.equal(result.svg, null);
         assert.equal(result.isOversized, false);
       });
+
+      it('8.7a preserves viewBox casing and allows markerWidth, markerHeight, refX, refY, gradientUnits, gradientTransform, preserveAspectRatio', () => {
+        const input = `
+          <svg viewBox="0 0 500 500" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="grad" gradientUnits="userSpaceOnUse" gradientTransform="rotate(45)">
+                <stop offset="0%" stop-color="#fff" />
+              </linearGradient>
+              <marker id="arrow" markerWidth="10" markerHeight="10" refX="5" refY="5">
+                <path d="M 0 0 L 10 5 L 0 10 z" />
+              </marker>
+            </defs>
+            <rect width="100" height="100" fill="url(#grad)" />
+          </svg>
+        `;
+        const result = sanitizeSvg(input);
+        assert.ok(result.svg);
+        assert.ok(result.svg.includes('viewBox="0 0 500 500"'), 'viewBox casing must be preserved');
+        assert.ok(result.svg.includes('preserveAspectRatio="xMidYMid meet"'), 'preserveAspectRatio must be allowed and casing preserved');
+        assert.ok(result.svg.includes('gradientUnits="userSpaceOnUse"'), 'gradientUnits must be allowed and casing preserved');
+        assert.ok(result.svg.includes('gradientTransform="rotate(45)"'), 'gradientTransform must be allowed and casing preserved');
+        assert.ok(result.svg.includes('markerWidth="10"'), 'markerWidth must be allowed and casing preserved');
+        assert.ok(result.svg.includes('markerHeight="10"'), 'markerHeight must be allowed and casing preserved');
+        assert.ok(result.svg.includes('refX="5"'), 'refX must be allowed and casing preserved');
+        assert.ok(result.svg.includes('refY="5"'), 'refY must be allowed and casing preserved');
+      });
+
+      it('8.7b in style attributes strips any url() that is not url(#id)', () => {
+        const input = `
+          <svg viewBox="0 0 100 100">
+            <path style="fill: url(#validId); stroke: url('https://evil.com/leak'); background: url(http://attacker.com/bg.png); filter: url(#filterRef);" />
+          </svg>
+        `;
+        const result = sanitizeSvg(input);
+        assert.ok(result.svg);
+        assert.ok(result.svg.includes('url(#validId)'), 'Must preserve url(#validId)');
+        assert.ok(result.svg.includes('url(#filterRef)'), 'Must preserve url(#filterRef)');
+        assert.ok(!result.svg.includes('https://evil.com/leak'), 'Must strip https url()');
+        assert.ok(!result.svg.includes('http://attacker.com/bg.png'), 'Must strip http url()');
+      });
+
+      it('8.7c drops empty <use> and attribute-less <a>', () => {
+        const input = `
+          <svg viewBox="0 0 100 100">
+            <use />
+            <use></use>
+            <use id="orphan" />
+            <use href="#valid-icon" />
+            <a>Unwrapped Text</a>
+            <a href="#safe-anchor">Safe Link</a>
+          </svg>
+        `;
+        const result = sanitizeSvg(input);
+        assert.ok(result.svg);
+        assert.ok(!result.svg.includes('<use />'), 'Must drop empty self-closing <use />');
+        assert.ok(!result.svg.includes('<use></use>'), 'Must drop empty <use></use>');
+        assert.ok(!result.svg.includes('id="orphan"'), 'Must drop <use> without href');
+        assert.ok(result.svg.includes('href="#valid-icon"'), 'Must keep <use> with href');
+        assert.ok(!result.svg.includes('<a>Unwrapped Text</a>'), 'Must drop attribute-less <a> tags');
+        assert.ok(result.svg.includes('Unwrapped Text'), 'Must preserve content of attribute-less <a>');
+        assert.ok(result.svg.includes('<a href="#safe-anchor">Safe Link</a>'), 'Must keep <a> with valid href');
+      });
+
+      it('8.7d strips <image> and <img> tags along with script, onload, foreignObject, iframe, and javascript:', () => {
+        const input = `
+          <svg viewBox="0 0 100 100" onload="alert('onload')">
+            <script>alert('script')</script>
+            <foreignObject width="10" height="10"><div>bad</div></foreignObject>
+            <iframe src="https://evil.com"></iframe>
+            <image href="https://evil.com/pic.png" width="50" height="50" />
+            <img src="https://evil.com/pic2.png" />
+            <a href="javascript:alert('xss')">bad link</a>
+            <circle cx="50" cy="50" r="10" />
+          </svg>
+        `;
+        const result = sanitizeSvg(input);
+        assert.ok(result.svg);
+        assert.ok(!result.svg.includes('<script'), 'Must not contain script');
+        assert.ok(!result.svg.includes('onload='), 'Must not contain onload');
+        assert.ok(!result.svg.includes('<foreignObject'), 'Must not contain foreignObject');
+        assert.ok(!result.svg.includes('<iframe'), 'Must not contain iframe');
+        assert.ok(!result.svg.includes('<image'), 'Must not contain <image>');
+        assert.ok(!result.svg.includes('<img'), 'Must not contain <img>');
+        assert.ok(!result.svg.includes('javascript:'), 'Must not contain javascript:');
+        assert.ok(result.svg.includes('<circle'), 'Must preserve safe SVG elements');
+      });
     });
 
     // Endpoint Integration Tests
@@ -1892,34 +1981,80 @@ Simple triangle diagram
       }
     });
 
-    it('9.2 GET /api/ask/capabilities requires auth and returns correct imageGeneration boolean', async () => {
+    it('9.2 GET /api/ask/capabilities requires auth and returns correct imageGeneration boolean and provider', async () => {
       const origModel = process.env.GEMINI_IMAGE_MODEL;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
 
       try {
         // Without auth -> 401
         const unauthRes = await request(server).get('/api/ask/capabilities');
         assert.equal(unauthRes.status, 401);
 
-        // With GEMINI_IMAGE_MODEL set -> true
+        // With GEMINI_IMAGE_MODEL set -> true, provider: 'gemini'
+        delete process.env.IMAGE_PROVIDER;
+        delete process.env.CF_ACCOUNT_ID;
+        delete process.env.CF_API_TOKEN;
         process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
         const resTrue = await request(server)
           .get('/api/ask/capabilities')
           .set('Authorization', authGenImgUser);
         assert.equal(resTrue.status, 200);
-        assert.deepEqual(resTrue.body, { imageGeneration: true });
+        assert.equal(resTrue.body.imageGeneration, true);
+        assert.equal(resTrue.body.provider, 'gemini');
 
-        // With GEMINI_IMAGE_MODEL unset -> false
+        // With IMAGE_PROVIDER = 'cloudflare' and CF credentials set
+        process.env.IMAGE_PROVIDER = 'cloudflare';
+        process.env.CF_ACCOUNT_ID = 'test-cf-account';
+        process.env.CF_API_TOKEN = 'test-cf-token';
+        const resCf = await request(server)
+          .get('/api/ask/capabilities')
+          .set('Authorization', authGenImgUser);
+        assert.equal(resCf.status, 200);
+        assert.equal(resCf.body.imageGeneration, true);
+        assert.equal(resCf.body.provider, 'cloudflare');
+
+        // With IMAGE_PROVIDER = 'none'
+        process.env.IMAGE_PROVIDER = 'none';
+        const resNone = await request(server)
+          .get('/api/ask/capabilities')
+          .set('Authorization', authGenImgUser);
+        assert.equal(resNone.status, 200);
+        assert.equal(resNone.body.imageGeneration, false);
+        assert.equal(resNone.body.provider, 'none');
+
+        // With GEMINI_IMAGE_MODEL unset and no credentials -> false, provider: 'none'
+        delete process.env.IMAGE_PROVIDER;
         delete process.env.GEMINI_IMAGE_MODEL;
+        delete process.env.CF_ACCOUNT_ID;
+        delete process.env.CF_API_TOKEN;
         const resFalse = await request(server)
           .get('/api/ask/capabilities')
           .set('Authorization', authGenImgUser);
         assert.equal(resFalse.status, 200);
-        assert.deepEqual(resFalse.body, { imageGeneration: false });
+        assert.equal(resFalse.body.imageGeneration, false);
+        assert.equal(resFalse.body.provider, 'none');
       } finally {
         if (origModel) {
           process.env.GEMINI_IMAGE_MODEL = origModel;
         } else {
           delete process.env.GEMINI_IMAGE_MODEL;
+        }
+        if (origProvider) {
+          process.env.IMAGE_PROVIDER = origProvider;
+        } else {
+          delete process.env.IMAGE_PROVIDER;
+        }
+        if (origAccount) {
+          process.env.CF_ACCOUNT_ID = origAccount;
+        } else {
+          delete process.env.CF_ACCOUNT_ID;
+        }
+        if (origToken) {
+          process.env.CF_API_TOKEN = origToken;
+        } else {
+          delete process.env.CF_API_TOKEN;
         }
       }
     });
@@ -2501,6 +2636,338 @@ Flowchart of algorithms
       } finally {
         mockGetClient.mock.restore();
         mockFallback.mock.restore();
+      }
+    });
+
+    it('9.16 isImageGenerationRequest requires explicit start imperative and rejects non-image queries', async () => {
+      // Negative tests: questions containing "make" or "create" without imperative image intent
+      assert.equal(isImageGenerationRequest('How do I make a good poster presentation?'), false);
+      assert.equal(isImageGenerationRequest('Explain how to create a picture book report'), false);
+      assert.equal(isImageGenerationRequest('What is a photo?'), false);
+      assert.equal(isImageGenerationRequest('Can we create slides for a lecture?'), false);
+
+      // Positive tests: English explicit imperatives at start
+      assert.equal(isImageGenerationRequest('draw an image of the water cycle'), true);
+      assert.equal(isImageGenerationRequest('generate a picture of a chloroplast'), true);
+      assert.equal(isImageGenerationRequest('create an illustration of photosynthesis'), true);
+      assert.equal(isImageGenerationRequest('make a photo of Mount Everest'), true);
+      assert.equal(isImageGenerationRequest('produce a drawing of animal cell'), true);
+      assert.equal(isImageGenerationRequest('please draw a picture of mitochondria'), true);
+
+      // Positive tests: Tamil explicit imperatives
+      assert.equal(isImageGenerationRequest('ஒரு படம் வரைக மனித இதயம்'), true);
+      assert.equal(isImageGenerationRequest('படத்தை உருவாக்கு தாவர செல்'), true);
+      assert.equal(isImageGenerationRequest('புகைப்படம் ஒன்றை வரைக'), true);
+
+      // Integration test with server: Ensure non-image requests in auto mode route to text model, NOT image
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => '[MODE: doubt]\nA good poster presentation requires clear visual hierarchy and concise summaries.'
+      );
+
+      try {
+        const res1 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'How do I make a good poster presentation?',
+            mode: 'auto',
+          });
+        assert.equal(res1.status, 200);
+        assert.notEqual(res1.body.resolvedMode, 'image');
+        assert.equal(res1.body.resolvedMode, 'doubt');
+        assert.equal(res1.body.image, undefined);
+
+        const res2 = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'Explain how to create a picture book report',
+            mode: 'auto',
+          });
+        assert.equal(res2.status, 200);
+        assert.notEqual(res2.body.resolvedMode, 'image');
+        assert.equal(res2.body.resolvedMode, 'doubt');
+        assert.equal(res2.body.image, undefined);
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+      }
+    });
+
+    it('9.17 Cloudflare image generation REST client succeeds with base64 and maps errors', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      process.env.CF_ACCOUNT_ID = 'cf-test-account-id';
+      process.env.CF_API_TOKEN = 'cf-test-token-xyz';
+
+      // 1. Success case: returns image/png with base64 data
+      const fakeImageBytes = Buffer.from('fake-cloudflare-flux-image-bytes');
+      let capturedUrl = '';
+      let capturedHeaders = {};
+      const mockFetchSuccess = mock.method(global, 'fetch', async (url, options) => {
+        capturedUrl = url;
+        capturedHeaders = options.headers;
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'image/png' },
+          arrayBuffer: async () => fakeImageBytes.buffer.slice(fakeImageBytes.byteOffset, fakeImageBytes.byteOffset + fakeImageBytes.byteLength),
+        };
+      });
+
+      try {
+        const result = await generateCloudflareImage('Draw a picture of an atom');
+        assert.equal(result.image.mimeType, 'image/png');
+        assert.equal(result.image.data, fakeImageBytes.toString('base64'));
+        assert.ok(result.caption);
+        assert.match(capturedUrl, /@cf\/black-forest-labs\/flux-1-schnell/);
+        assert.match(capturedHeaders['Authorization'], /Bearer cf-test-token-xyz/);
+      } finally {
+        mockFetchSuccess.mock.restore();
+      }
+
+      // 2. Unsafe/blocked content error: returns 400 ImageGenError
+      const mockFetchSafety = mock.method(global, 'fetch', async () => ({
+        ok: false,
+        status: 400,
+        headers: { get: () => 'application/json' },
+        json: async () => ({ errors: [{ message: 'Prompt was flagged by safety filter' }] }),
+        text: async () => JSON.stringify({ errors: [{ message: 'Prompt was flagged by safety filter' }] }),
+      }));
+
+      try {
+        await assert.rejects(
+          async () => generateCloudflareImage('Unsafe topic prompt'),
+          (err) => {
+            assert.equal(err.status, 400);
+            assert.match(err.message, /safety filter/i);
+            return true;
+          }
+        );
+      } finally {
+        mockFetchSafety.mock.restore();
+      }
+
+      // 3. Credentials missing throws 503 ImageGenError
+      delete process.env.CF_ACCOUNT_ID;
+      await assert.rejects(
+        async () => generateCloudflareImage('Draw a cell'),
+        (err) => {
+          assert.equal(err.status, 503);
+          assert.match(err.message, /not configured/i);
+          return true;
+        }
+      );
+
+      // Restore credentials
+      if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+      if (origToken) process.env.CF_API_TOKEN = origToken;
+    });
+
+    it('9.18 fallback to SVG diagram and refund slot on image provider failure', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'gemini';
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+      const today = getKolkataDateString();
+
+      // Mock image provider failure
+      const mockFetch = mock.method(global, 'fetch', async () => {
+        throw new Error('Image generation upstream network failure');
+      });
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => `=== DESCRIPTION ===
+Fallback Diagram of Water Molecule
+=== SVG ===
+<svg viewBox="0 0 300 150" xmlns="http://www.w3.org/2000/svg"><circle cx="150" cy="75" r="40" fill="#3b82f6"/></svg>`
+      );
+
+      try {
+        const usageBefore = await AskUsage.findOne({ user: genImgUser._id, date: today });
+        const imgCountBefore = usageBefore?.imageCount || 0;
+
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'draw an image of water molecule',
+            mode: 'auto',
+          });
+
+        assert.equal(res.status, 200);
+        assert.equal(res.body.resolvedMode, 'svg');
+        assert.ok(res.body.svg);
+        assert.match(res.body.description, /Fallback Diagram/i);
+
+        // Ensure imageCount slot was refunded
+        const usageAfter = await AskUsage.findOne({ user: genImgUser._id, date: today });
+        assert.equal(usageAfter?.imageCount || 0, imgCountBefore, 'imageCount must be refunded after fallback');
+      } finally {
+        mockFetch.mock.restore();
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+      }
+    });
+
+    it('9.19 global daily cap IMAGE_DAILY_GLOBAL_CAP enforced in GlobalImageUsage and falls back or limits', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      const origCap = process.env.IMAGE_DAILY_GLOBAL_CAP;
+      process.env.IMAGE_PROVIDER = 'gemini';
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+      process.env.IMAGE_DAILY_GLOBAL_CAP = '10';
+      const today = getKolkataDateString();
+
+      // Seed GlobalImageUsage to cap
+      await GlobalImageUsage.findOneAndUpdate(
+        { date: today },
+        { count: 10 },
+        { upsert: true, new: true }
+      );
+
+      try {
+        // Direct image mode -> 429 global limit reached
+        const resDirect = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGenImgUser)
+          .send({
+            question: 'draw a picture of chloroplast',
+            mode: 'image',
+          });
+
+        assert.equal(resDirect.status, 429);
+        assert.match(resDirect.body.message, /global image generation limit reached/i);
+      } finally {
+        await GlobalImageUsage.deleteMany({ date: today });
+        if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+        if (origCap) process.env.IMAGE_DAILY_GLOBAL_CAP = origCap;
+      }
+    });
+
+    it('9.20 GET /api/ask/conversations/:id does not duplicate messages and stored SVG size is capped at 60 KB', async () => {
+      // Create a test conversation with an SVG under 100 KB total limit
+      const largeSvgContent = '<svg viewBox="0 0 100 100">' + '<path d="M0 0 L10 10"/>'.repeat(2500) + '</svg>';
+      const sanitized = sanitizeSvg(largeSvgContent);
+      assert.ok(sanitized.svg, 'Sanitized SVG should be valid and under 100 KB');
+
+      const conv = await Conversation.create({
+        user: genImgUser._id,
+        title: 'Test SVG Capping Conversation',
+        messages: [
+          {
+            role: 'user',
+            content: 'Generate a detailed diagram',
+            mode: 'svg',
+          },
+          {
+            role: 'assistant',
+            content: sanitized.svg.slice(0, MAX_STORED_SVG_BYTES),
+            svg: sanitized.svg.slice(0, MAX_STORED_SVG_BYTES),
+            description: 'Large test diagram',
+            mode: 'svg',
+          },
+        ],
+      });
+
+      const convRes = await request(server)
+        .get(`/api/ask/conversations/${conv._id}`)
+        .set('Authorization', authGenImgUser);
+
+      assert.equal(convRes.status, 200);
+      // Verify no top-level "conversation" field duplicating "messages"
+      assert.equal(convRes.body.conversation, undefined, 'Must not duplicate conversation object at top level');
+      assert.ok(Array.isArray(convRes.body.messages));
+      assert.equal(convRes.body.messages.length, 2);
+      assert.ok(convRes.body.messages[1].svg.length <= MAX_STORED_SVG_BYTES, 'Stored SVG must be capped at 60 KB');
+
+      await Conversation.deleteOne({ _id: conv._id });
+    });
+
+    it('9.21 12 parallel image requests: exactly 5 succeed and 7 receive 429 rate limit', async () => {
+      const origModel = process.env.GEMINI_IMAGE_MODEL;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'gemini';
+      process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
+      const today = getKolkataDateString();
+
+      // Create a fresh test user to avoid hitting the windowMs limit of askRateLimiter (30/15m)
+      const parallelUser = await User.create({
+        name: 'Parallel Test Student',
+        email: `parallel_${Date.now()}@test.edu`,
+        password: 'password123',
+      });
+      const authParallelUser = `Bearer ${jwt.sign({ id: parallelUser._id }, getJwtSecret(), { expiresIn: '1h' })}`;
+
+      await AskUsage.deleteMany({ user: parallelUser._id });
+      await GlobalImageUsage.deleteMany({ date: today });
+
+      const fakeBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  { text: 'Biology diagram illustration' },
+                  { inlineData: { mimeType: 'image/png', data: fakeBase64 } },
+                ],
+              },
+            },
+          ],
+        }),
+      }));
+
+      try {
+        const requests = Array.from({ length: 12 }, (_, i) =>
+          request(server)
+            .post('/api/ask')
+            .set('Authorization', authParallelUser)
+            .send({
+              question: `Draw an image of biology cell part ${i + 1}`,
+              mode: 'image',
+            })
+        );
+
+        const responses = await Promise.all(requests);
+        const succeeded = responses.filter((r) => r.status === 200);
+        const rateLimited = responses.filter((r) => r.status === 429);
+
+        assert.equal(succeeded.length, 5, `Expected exactly 5 to succeed, got ${succeeded.length}`);
+        assert.equal(rateLimited.length, 7, `Expected exactly 7 to be 429 rate-limited, got ${rateLimited.length}`);
+
+        for (const r of rateLimited) {
+          assert.match(r.body.message, /Daily image generation limit reached/i);
+        }
+
+        const finalUsage = await AskUsage.findOne({ user: parallelUser._id, date: today });
+        assert.equal(finalUsage.imageCount, 5, 'User imageCount must be exactly 5');
+      } finally {
+        mockFetch.mock.restore();
+        if (origModel) {
+          process.env.GEMINI_IMAGE_MODEL = origModel;
+        } else {
+          delete process.env.GEMINI_IMAGE_MODEL;
+        }
+        if (origProvider) {
+          process.env.IMAGE_PROVIDER = origProvider;
+        } else {
+          delete process.env.IMAGE_PROVIDER;
+        }
+        await AskUsage.deleteMany({ user: parallelUser._id });
+        await GlobalImageUsage.deleteMany({ date: today });
+        await User.deleteOne({ _id: parallelUser._id });
       }
     });
   });

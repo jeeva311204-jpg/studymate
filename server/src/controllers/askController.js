@@ -1,10 +1,12 @@
 const mongoose = require('mongoose');
 const Note = require('../models/Note');
 const AskUsage = require('../models/AskUsage');
+const GlobalImageUsage = require('../models/GlobalImageUsage');
 const Conversation = require('../models/Conversation');
 const geminiConfig = require('../config/gemini');
 const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
 const { generateGeminiImage, ImageGenError } = require('../utils/geminiImage');
+const { generateCloudflareImage } = require('../utils/cloudflareImage');
 
 const ALLOWED_MODES = ['auto', 'doubt', 'mark2', 'mark8', 'mark16', 'short_notes', 'simple', 'svg', 'image'];
 
@@ -15,6 +17,7 @@ const MAX_CONVERSATIONS_PER_USER = 30;
 const MAX_MESSAGES_PER_CONVERSATION = 40;
 const MAX_HISTORY_MESSAGES = 10;
 const MAX_HISTORY_CHARS_PER_MESSAGE = 1500;
+const MAX_STORED_SVG_BYTES = 60 * 1024; // 60 KB limit
 const DEFAULT_IMAGE_QUESTION = 'Explain what is shown in this image and answer anything that is asked in it.';
 
 const MODE_MAX_TOKENS = {
@@ -41,13 +44,19 @@ const MODE_PROMPT_INSTRUCTIONS = {
 
 /**
  * Auto mode detection: IMAGE request
- * Creation verb near image noun (image, picture, photo, illustration, drawing, poster)
+ * Requires an explicit imperative at the start (draw, generate/create/make an image/picture/photo/illustration of ..., plus Tamil equivalents)
  */
 const isImageGenerationRequest = (text) => {
   if (!text || typeof text !== 'string') return false;
-  const pattern1 = /\b(generate|create|make|draw|produce)\b(?:\s+\S+){0,5}\s+\b(images?|pictures?|photos?|illustrations?|drawings?|posters?)\b/i;
-  const pattern2 = /\b(images?|pictures?|photos?|illustrations?|drawings?|posters?)\b(?:\s+\S+){0,5}\s+\b(generate|create|make|draw|produce)\b/i;
-  return pattern1.test(text) || pattern2.test(text);
+  const trimmed = text.trim();
+
+  // English: imperative verb at the beginning followed by image noun
+  const englishPattern = /^(?:please\s+|kindly\s+)?(?:draw|generate|create|make|produce)\s+(?:an?|the)?\s*(?:image|picture|photo|illustration|drawing)\s*(?:of|for)?\b/i;
+
+  // Tamil: imperative at the beginning (verb + image noun or image noun + verb)
+  const tamilPattern = /^(?:தயவுசெய்து\s+)?(?:(?:ஒரு\s+)?(?:படம்|புகைப்படம்|சித்திரம்|ஓவியம்|படத்தை|புகைப்படத்தை|சித்திரத்தை|ஓவியத்தை)\s*(?:ஒன்றை\s*)?(?:வரை(?:க|ந்து\s*காட்டு)?|உருவாக்கு(?:க|வும்)?)|(?:வரை(?:க)?|உருவாக்கு(?:க|வும்)?)\s+(?:ஒரு\s+)?(?:படம்|புகைப்படம்|சித்திரம்|ஓவியம்))/u;
+
+  return englishPattern.test(trimmed) || tamilPattern.test(trimmed);
 };
 
 /**
@@ -60,6 +69,30 @@ const isSvgDiagramRequest = (text) => {
   const pattern1 = /\b(generate|create|make|draw|produce)\b(?:\s+\S+){0,5}\s+\b(diagrams?|flowcharts?|charts?)\b/i;
   const pattern2 = /\b(diagrams?|flowcharts?|charts?)\b(?:\s+\S+){0,5}\s+\b(generate|create|make|draw|produce)\b/i;
   return pattern1.test(text) || pattern2.test(text);
+};
+
+/**
+ * Resolves active image generation provider (cloudflare | gemini | none)
+ */
+const getImageProvider = () => {
+  const envProvider = (process.env.IMAGE_PROVIDER || '').trim().toLowerCase();
+  if (envProvider) {
+    if (envProvider === 'cloudflare') {
+      return (process.env.CF_ACCOUNT_ID && process.env.CF_API_TOKEN) ? 'cloudflare' : 'none';
+    }
+    if (envProvider === 'gemini') {
+      return (process.env.GEMINI_IMAGE_MODEL && process.env.GEMINI_IMAGE_MODEL.trim()) ? 'gemini' : 'none';
+    }
+    return 'none';
+  }
+  // Auto-detection when IMAGE_PROVIDER is not set:
+  if (process.env.CF_ACCOUNT_ID && process.env.CF_API_TOKEN) {
+    return 'cloudflare';
+  }
+  if (process.env.GEMINI_IMAGE_MODEL && process.env.GEMINI_IMAGE_MODEL.trim()) {
+    return 'gemini';
+  }
+  return 'none';
 };
 
 
@@ -262,12 +295,120 @@ exports.askQuestion = async (req, res) => {
       }
     }
 
+    // Helper for falling back to SVG diagram
+    const handleSvgFallback = async (q, userReq, userRes, fallbackDate, conv, origMode) => {
+      try {
+        await AskUsage.findOneAndUpdate(
+          { user: userReq.user._id, date: fallbackDate, count: { $lt: DAILY_ASK_LIMIT } },
+          { $inc: { count: 1 } },
+          { upsert: true }
+        );
+      } catch (_) {}
+
+      const svgFallbackPrompt = `You are StudyMate AI, an expert academic tutor and study assistant.
+Format requirements: You must generate a diagram for the student as a single valid, self-contained SVG, plus a one-line description in a separate field.
+Return ONLY two sections formatted EXACTLY like this:
+=== DESCRIPTION ===
+<one-line plain text description of the diagram>
+=== SVG ===
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200">
+...
+</svg>
+
+CRITICAL RULES:
+1. Must be a single valid, self-contained SVG with viewBox attribute.
+2. Absolutely NO external resources, NO <script>, NO <foreignObject>, NO <iframe>, and NO <img>/<image> tags.
+3. Clean, clearly readable text labels with dark/light contrast.
+4. Simple, clean styling.
+5. Output raw SVG directly under === SVG === without markdown code fences.
+
+Student Question:
+"${q}"`;
+
+      let rawFallbackAnswer = '';
+      try {
+        rawFallbackAnswer = await geminiConfig.generateWithModelFallback(svgFallbackPrompt, {
+          generationConfig: { maxOutputTokens: 4096 },
+        });
+      } catch (err) {
+        console.error('[AskController] SVG fallback Gemini generation error:', err.message);
+        rawFallbackAnswer = `=== DESCRIPTION ===
+Diagram for ${q.slice(0, 40)}
+=== SVG ===
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200"><rect width="400" height="200" fill="#f8fafc" stroke="#cbd5e1"/><text x="200" y="100" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#334155">${q.slice(0, 40)}</text></svg>`;
+      }
+
+      let desc = 'Educational diagram';
+      let rawSvgContent = '';
+      const dMatch = rawFallbackAnswer.match(/===\s*DESCRIPTION\s*===([\s\S]*?)(?:===\s*SVG\s*===|<svg|$)/i);
+      if (dMatch) {
+        desc = dMatch[1].trim().split('\n')[0].trim();
+      }
+      const sMatch = rawFallbackAnswer.match(/<svg[\s\S]*<\/svg>/i);
+      if (sMatch) {
+        rawSvgContent = sMatch[0];
+      } else {
+        rawSvgContent = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200"><rect width="400" height="200" fill="#f8fafc" stroke="#cbd5e1"/><text x="200" y="100" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#334155">${q.slice(0, 40)}</text></svg>`;
+      }
+
+      const sResult = sanitizeSvg(rawSvgContent);
+      const cleanSvg = sResult.svg || rawSvgContent;
+      const storedSvg = Buffer.byteLength(cleanSvg, 'utf8') > MAX_STORED_SVG_BYTES
+        ? cleanSvg.slice(0, MAX_STORED_SVG_BYTES)
+        : cleanSvg;
+
+      let savedId = null;
+      const uMsg = {
+        role: 'user',
+        content: q,
+        mode: origMode,
+        hasImage: false,
+        createdAt: new Date(),
+      };
+      const aMsg = {
+        role: 'assistant',
+        content: cleanSvg,
+        svg: storedSvg,
+        description: desc,
+        mode: 'svg',
+        hasImage: false,
+        createdAt: new Date(),
+      };
+
+      if (conv) {
+        conv.messages.push(uMsg);
+        conv.messages.push(aMsg);
+        conv.updatedAt = new Date();
+        await conv.save();
+        savedId = conv._id;
+      } else {
+        const t = q.slice(0, 60);
+        const newConv = new Conversation({
+          user: userReq.user._id,
+          title: t,
+          messages: [uMsg, aMsg],
+        });
+        await newConv.save();
+        savedId = newConv._id;
+      }
+
+      return userRes.status(200).json({
+        svg: cleanSvg,
+        description: desc,
+        answer: cleanSvg,
+        mode: 'svg',
+        resolvedMode: 'svg',
+        fallback: true,
+        conversationId: savedId,
+      });
+    };
+
     // 5.5 Auto mode routing & Image Mode handling
     let effectiveMode = mode;
     if (mode === 'auto' && !hasImage) {
       if (isImageGenerationRequest(trimmedQuestion)) {
-        const configuredImageModel = process.env.GEMINI_IMAGE_MODEL;
-        if (configuredImageModel && configuredImageModel.trim()) {
+        const provider = getImageProvider();
+        if (provider !== 'none') {
           effectiveMode = 'image';
         } else {
           // Normal 200 answer without counting against image cap or daily ask cap
@@ -320,23 +461,54 @@ exports.askQuestion = async (req, res) => {
     }
 
     if (effectiveMode === 'image') {
-      const imageModel = process.env.GEMINI_IMAGE_MODEL;
-      if (!imageModel || !imageModel.trim()) {
+      const provider = getImageProvider();
+      const shouldFallback = (mode === 'auto') || Boolean(req.body.fallback || req.body.fallbackToSvg);
+
+      if (provider === 'none') {
+        if (shouldFallback) {
+          today = getKolkataDateString();
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode);
+        }
         return res.status(503).json({
           error: true,
           message: 'Image generation is not configured',
         });
       }
 
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey || apiKey === 'your_gemini_api_key_here') {
-        return res.status(503).json({
+      today = getKolkataDateString();
+      const globalCap = parseInt(process.env.IMAGE_DAILY_GLOBAL_CAP, 10) || 100;
+
+      // 1. Atomically check and reserve global daily cap
+      let reservedGlobal = null;
+      try {
+        reservedGlobal = await GlobalImageUsage.findOneAndUpdate(
+          { date: today, count: { $lt: globalCap } },
+          { $inc: { count: 1 } },
+          { upsert: true, new: true }
+        );
+      } catch (err) {
+        if (err.code === 11000) {
+          reservedGlobal = await GlobalImageUsage.findOneAndUpdate(
+            { date: today, count: { $lt: globalCap } },
+            { $inc: { count: 1 } },
+            { new: true }
+          );
+        } else {
+          throw err;
+        }
+      }
+
+      if (!reservedGlobal) {
+        if (shouldFallback) {
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode);
+        }
+        return res.status(429).json({
           error: true,
-          message: 'Ask AI service is unavailable: GEMINI_API_KEY is not configured in server/.env.',
+          message: `Daily global image generation limit reached (${globalCap} images per day). Please try again tomorrow.`,
         });
       }
 
-      today = getKolkataDateString();
+      // 2. Atomically check and reserve per-user daily cap
       let reservedSlotObj = null;
       try {
         reservedSlotObj = await AskUsage.findOneAndUpdate(
@@ -362,11 +534,18 @@ exports.askQuestion = async (req, res) => {
             { new: true }
           );
         } else {
+          await GlobalImageUsage.updateOne({ date: today }, { $inc: { count: -1 } }).catch(() => {});
           throw err;
         }
       }
 
       if (!reservedSlotObj) {
+        await GlobalImageUsage.updateOne({ date: today }, { $inc: { count: -1 } }).catch(() => {});
+
+        if (shouldFallback) {
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode);
+        }
+
         const usage = await AskUsage.findOne({ user: req.user._id, date: today });
         if (usage && usage.count >= DAILY_ASK_LIMIT) {
           return res.status(429).json({
@@ -382,13 +561,25 @@ exports.askQuestion = async (req, res) => {
 
       let generatedResult;
       try {
-        generatedResult = await generateGeminiImage(trimmedQuestion);
+        if (provider === 'cloudflare') {
+          generatedResult = await generateCloudflareImage(trimmedQuestion);
+        } else {
+          generatedResult = await generateGeminiImage(trimmedQuestion);
+        }
       } catch (imgErr) {
-        // Roll back both reserved slots on failure
+        // Refund both reserved slots on failure
         await AskUsage.updateOne(
           { user: req.user._id, date: today },
           { $inc: { count: -1, imageCount: -1 } }
         ).catch(() => {});
+        await GlobalImageUsage.updateOne(
+          { date: today },
+          { $inc: { count: -1 } }
+        ).catch(() => {});
+
+        if (shouldFallback) {
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode);
+        }
 
         const statusCode = imgErr.status || 503;
         return res.status(statusCode).json({
@@ -487,7 +678,7 @@ exports.askQuestion = async (req, res) => {
       reservedSlot = false;
       return res.status(503).json({
         error: true,
-        message: 'Ask AI service is unavailable: GEMINI_API_KEY is not configured in server/.env.',
+        message: 'AI service is temporarily unavailable. Please try again in a minute.',
       });
     }
 
@@ -578,24 +769,24 @@ Student Question:
         },
       });
     } catch (geminiErr) {
-      console.error('[AskController] Gemini generation error:', geminiErr.message);
+      console.error('[AskController] Gemini generation error:', geminiErr);
       await AskUsage.updateOne(
         { user: req.user._id, date: today },
         { $inc: { count: -1 } }
       );
       reservedSlot = false;
 
-      const errMsg = (geminiErr.message || '').toLowerCase();
+      const errMsg = (geminiErr?.message || '').toLowerCase();
       if (hasImage && (errMsg.includes('image') || errMsg.includes('inlinedata') || errMsg.includes('multimodal') || errMsg.includes('media'))) {
         return res.status(400).json({
           error: true,
-          message: `Image processing error: ${geminiErr.message || 'The model was unable to process the attached image.'}`,
+          message: 'The model was unable to process the attached image. Please try a different image.',
         });
       }
 
       return res.status(503).json({
         error: true,
-        message: geminiErr.message || 'Ask AI service is temporarily unavailable. Please try again later.',
+        message: 'AI is busy, please try again in a minute.',
       });
     }
 
@@ -700,6 +891,9 @@ Student Question:
       }
 
       const sanitizedSvg = sanitizedResult.svg;
+      const storedSvg = Buffer.byteLength(sanitizedSvg, 'utf8') > MAX_STORED_SVG_BYTES
+        ? sanitizedSvg.slice(0, MAX_STORED_SVG_BYTES)
+        : sanitizedSvg;
 
       let savedConversationId = null;
       const userMessage = {
@@ -711,8 +905,8 @@ Student Question:
       };
       const assistantMessage = {
         role: 'assistant',
-        content: sanitizedSvg,
-        svg: sanitizedSvg,
+        content: storedSvg,
+        svg: storedSvg,
         description,
         mode: 'svg',
         hasImage: false,
@@ -853,7 +1047,6 @@ exports.getConversationById = async (req, res) => {
     }
 
     return res.status(200).json({
-      conversation,
       id: conversation._id.toString(),
       _id: conversation._id,
       title: conversation.title,
@@ -951,17 +1144,22 @@ exports.deleteConversation = async (req, res) => {
 };
 
 /**
- * @desc    Get AI capabilities (checks if image generation is configured)
+ * @desc    Get AI capabilities (checks active image generation provider)
  * @route   GET /api/ask/capabilities
  * @access  Private
  */
 exports.getCapabilities = async (req, res) => {
-  const model = process.env.GEMINI_IMAGE_MODEL;
-  const imageGeneration = Boolean(model && model.trim());
-  return res.status(200).json({ imageGeneration });
+  const provider = getImageProvider();
+  const imageGeneration = provider !== 'none';
+  return res.status(200).json({
+    imageGeneration,
+    provider,
+  });
 };
 
 exports.getKolkataDateString = getKolkataDateString;
 exports.detectImageMimeType = detectImageMimeType;
 exports.isImageGenerationRequest = isImageGenerationRequest;
 exports.isSvgDiagramRequest = isSvgDiagramRequest;
+exports.getImageProvider = getImageProvider;
+exports.MAX_STORED_SVG_BYTES = MAX_STORED_SVG_BYTES;

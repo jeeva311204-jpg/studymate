@@ -15,6 +15,7 @@ const messageSchema = new mongoose.Schema(
     svg: {
       type: String,
       default: null,
+      maxlength: 60 * 1024,
     },
     description: {
       type: String,

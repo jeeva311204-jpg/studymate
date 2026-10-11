@@ -40,7 +40,7 @@ const getGeminiClient = () => {
 const getGenerativeModel = (options = {}) => {
   const client = getGeminiClient();
   if (!client) {
-    throw new Error('GEMINI_API_KEY is not configured in server/.env. Please provide a valid key.');
+    throw new Error('AI service is not configured. Please contact the administrator.');
   }
 
   const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
@@ -52,91 +52,77 @@ const getGenerativeModel = (options = {}) => {
 
 /**
  * Executes content generation with automatic multi-model failover on 503 (demand spike) or 429
- * @param {string} prompt - Prompt to send
+ * Limited to at most 3 candidate models and ~10s total timeout.
+ * Logs real errors server-side and throws a generic user-safe error.
+ * @param {string|Array} prompt - Prompt to send
  * @param {object} options - Generation options (e.g. responseMimeType)
  * @returns {Promise<string>} Text response
  */
 const generateWithModelFallback = async (prompt, options = {}) => {
   const client = getGeminiClient();
   if (!client) {
-    throw new Error('GEMINI_API_KEY is not configured in server/.env.');
+    throw new Error('AI service is not configured. Please contact the administrator.');
   }
 
   const preferredModel = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
-  const models = [preferredModel, ...CANDIDATE_MODELS.filter((m) => m !== preferredModel)];
+  const models = [preferredModel, ...CANDIDATE_MODELS.filter((m) => m !== preferredModel)].slice(0, 3);
 
-  const triedModels = [];
+  let lastError = null;
+  let preferredModelNotFound = false;
+  const startTime = Date.now();
+  const TOTAL_TIMEOUT_MS = 10000;
 
   for (const modelName of models) {
-    triedModels.push(modelName);
+    if (Date.now() - startTime >= TOTAL_TIMEOUT_MS) {
+      break;
+    }
 
-    // Retry transient spikes before switching models
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const model = client.getGenerativeModel({
-          model: modelName,
-          ...options,
-        });
+    try {
+      const model = client.getGenerativeModel({
+        model: modelName,
+        ...options,
+      });
 
-        const result = await model.generateContent(prompt);
-        const response = await result.response;
-        return response.text();
-      } catch (err) {
-        lastError = err;
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      return response.text();
+    } catch (err) {
+      lastError = err;
+      console.error(`[Gemini Fallback] Model ${modelName} encountered error:`, err.message);
 
-        if (isModelNotFoundError(err)) {
-          const triedList = triedModels.join(', ');
-          const notFoundError = new Error(
-            `Gemini model error: The requested model "${preferredModel}" was not found or is unsupported. Attempted models: [${triedList}]. Please verify GEMINI_MODEL in server/.env.`
-          );
-          notFoundError.status = 404;
-          throw notFoundError;
+      if (isModelNotFoundError(err)) {
+        if (modelName === preferredModel) {
+          preferredModelNotFound = true;
         }
-
-        const isTransient =
-          err.message?.includes('503') ||
-          err.message?.includes('429') ||
-          err.message?.includes('high demand') ||
-          err.message?.includes('Service Unavailable') ||
-          err.message?.includes('temporarily') ||
-          err.message?.includes('quota');
-
-        if (isTransient) {
-          const waitMs = attempt * 1500;
-          console.warn(`[Gemini Fallback] Model ${modelName} encountered 503 transient spike (attempt ${attempt}/2). Waiting ${waitMs}ms...`);
-          await new Promise((res) => setTimeout(res, waitMs));
-          continue;
-        }
-
-        throw err;
+        continue;
       }
+
+      const isTransient =
+        err.message?.includes('503') ||
+        err.message?.includes('429') ||
+        err.message?.includes('high demand') ||
+        err.message?.includes('Service Unavailable') ||
+        err.message?.includes('temporarily') ||
+        err.message?.includes('quota');
+
+      if (isTransient) {
+        const remainingTime = TOTAL_TIMEOUT_MS - (Date.now() - startTime);
+        if (remainingTime > 1500) {
+          console.warn(`[Gemini Fallback] Model ${modelName} transient spike. Waiting 1000ms...`);
+          await new Promise((res) => setTimeout(res, 1000));
+        }
+        continue;
+      }
+
+      break;
     }
   }
 
-  const triedList = triedModels.join(', ');
+  console.error('[Gemini Fallback] All fallback attempts exhausted. Real error details:', lastError);
 
-  // If preferred model was not found or all candidates were not found, return clean error listing tried models
-  if (preferredModelNotFound || isModelNotFoundError(lastError)) {
-    const notFoundError = new Error(
-      `Gemini model error: The requested model "${preferredModel}" was not found or is unsupported. Attempted models: [${triedList}]. Please verify GEMINI_MODEL in server/.env.`
-    );
-    notFoundError.status = 404;
-    throw notFoundError;
-  }
-
-  if (lastError && (lastError.message?.includes('503') || lastError.message?.includes('high demand'))) {
-    const busyError = new Error(
-      `Gemini AI servers are currently experiencing temporary high demand. Attempted models: [${triedList}]. Please try again in a few moments.`
-    );
-    busyError.status = 503;
-    throw busyError;
-  }
-
-  const cleanError = new Error(
-    `Gemini AI generation failed. Attempted models: [${triedList}]. Please verify GEMINI_MODEL in server/.env.`
-  );
-  cleanError.status = lastError?.status || 500;
-  throw cleanError;
+  const userSafeError = new Error('AI is busy, please try again in a minute.');
+  userSafeError.status = lastError?.status || (preferredModelNotFound ? 404 : 503);
+  throw userSafeError;
 };
 
 module.exports = {
