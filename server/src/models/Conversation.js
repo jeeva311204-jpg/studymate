@@ -46,10 +46,6 @@ const messageSchema = new mongoose.Schema(
       maxlength: 1000,
       default: undefined,
     },
-    imageSeed: {
-      type: Number,
-      default: undefined,
-    },
     createdAt: {
       type: Date,
       default: Date.now,

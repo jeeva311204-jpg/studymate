@@ -170,7 +170,6 @@ exports.askQuestion = async (req, res) => {
 
     let isRegenerate = false;
     let regeneratePrompt = null;
-    let regenerateSeed = null;
     let targetMessage = null;
     let existingConversation = null;
 
@@ -209,16 +208,15 @@ exports.askQuestion = async (req, res) => {
         });
       }
 
-      if (!targetMessage.imagePrompt || targetMessage.imageSeed === undefined || targetMessage.imageSeed === null) {
+      if (!targetMessage.imagePrompt) {
         return res.status(400).json({
           error: true,
-          message: 'This message cannot be regenerated as an exact image (missing prompt or seed).',
+          message: 'This message cannot be regenerated (missing stored image prompt).',
         });
       }
 
       isRegenerate = true;
       regeneratePrompt = targetMessage.imagePrompt;
-      regenerateSeed = targetMessage.imageSeed;
       existingConversation = targetConv;
     }
 
@@ -624,14 +622,13 @@ Diagram for ${q.slice(0, 40)}
       }
 
       const imagePrompt = stripTextAndLabelRequests(trimmedQuestion);
-      const seedOptions = isRegenerate && regenerateSeed !== null && regenerateSeed !== undefined ? { seed: regenerateSeed } : {};
 
       let generatedResult;
       try {
         if (provider === 'cloudflare') {
-          generatedResult = await generateCloudflareImage(imagePrompt, seedOptions);
+          generatedResult = await generateCloudflareImage(imagePrompt);
         } else {
-          generatedResult = await generateGeminiImage(imagePrompt, seedOptions);
+          generatedResult = await generateGeminiImage(imagePrompt);
         }
       } catch (imgErr) {
         // Refund both reserved slots on failure
@@ -655,11 +652,6 @@ Diagram for ${q.slice(0, 40)}
           message: imgErr.message || 'Image generation failed.',
         });
       }
-
-      const finalSeed =
-        generatedResult.seed !== undefined
-          ? generatedResult.seed
-          : (regenerateSeed !== null && regenerateSeed !== undefined ? regenerateSeed : Math.floor(Math.random() * 4294967296));
 
       // Generate or reuse key parts using the text model
       let keyParts = [];
@@ -723,7 +715,6 @@ Requirements:
           mode: 'image',
           generatedImage: true,
           imagePrompt: trimmedQuestion.slice(0, 1000),
-          imageSeed: finalSeed,
           keyParts: keyParts.length > 0 ? keyParts : undefined,
           hasImage: false,
           createdAt: new Date(),
@@ -757,7 +748,6 @@ Requirements:
         caption: generatedResult.caption || `Educational illustration for: ${trimmedQuestion}`,
         answer: generatedResult.caption || `Educational illustration for: ${trimmedQuestion}`,
         imagePrompt: trimmedQuestion.slice(0, 1000),
-        imageSeed: finalSeed,
         keyParts: keyParts.length > 0 ? keyParts : [],
         mode: 'image',
         resolvedMode: 'image',

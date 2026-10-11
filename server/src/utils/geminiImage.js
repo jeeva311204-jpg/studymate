@@ -76,11 +76,6 @@ const generateGeminiImage = async (prompt, options = {}) => {
 
   const educationalPrompt = buildEducationalPrompt(prompt);
 
-  const seed =
-    options.seed !== undefined && options.seed !== null && !isNaN(Number(options.seed))
-      ? Math.max(0, Math.min(4294967295, Math.floor(Number(options.seed))))
-      : Math.floor(Math.random() * 4294967296);
-
   const requestBody = {
     contents: [
       {
@@ -226,7 +221,6 @@ const generateGeminiImage = async (prompt, options = {}) => {
       data: imagePart.inlineData.data,
     },
     caption,
-    seed,
   };
 };
 

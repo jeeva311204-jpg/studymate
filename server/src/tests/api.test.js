@@ -3387,7 +3387,7 @@ Diagram of the water cycle
       }
     });
 
-    it('9.25 cloudflare flux-1-schnell sends numeric seed (0..4294967295) and fixed steps (4), and returns seed', async () => {
+    it('9.25 cloudflare flux-1-schnell sends only prompt and steps (4), request body has no seed field, and returns no seed', async () => {
       const origAccount = process.env.CF_ACCOUNT_ID;
       const origToken = process.env.CF_API_TOKEN;
       process.env.CF_ACCOUNT_ID = 'cf-test-acc';
@@ -3410,19 +3410,13 @@ Diagram of the water cycle
       });
 
       try {
-        // Without options.seed: should generate random numeric seed
         const resA = await generateCloudflareImage('Draw an atom');
         assert.ok(capturedBody);
         assert.equal(capturedBody.steps, 4);
-        assert.equal(typeof capturedBody.seed, 'number');
-        assert.ok(capturedBody.seed >= 0 && capturedBody.seed <= 4294967295);
-        assert.equal(resA.seed, capturedBody.seed);
-
-        // With options.seed: should send exact provided seed
-        const resB = await generateCloudflareImage('Draw an atom', { seed: 123456789 });
-        assert.equal(capturedBody.steps, 4);
-        assert.equal(capturedBody.seed, 123456789);
-        assert.equal(resB.seed, 123456789);
+        assert.strictEqual(capturedBody.seed, undefined, 'Request body must not contain seed');
+        assert.strictEqual('seed' in capturedBody, false, 'capturedBody must not have seed property');
+        assert.deepStrictEqual(Object.keys(capturedBody).sort(), ['prompt', 'steps']);
+        assert.strictEqual(resA.seed, undefined, 'Returned value must not have seed');
       } finally {
         mockFetch.mock.restore();
         if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
@@ -3432,7 +3426,7 @@ Diagram of the water cycle
       }
     });
 
-    it('9.26 image generation stores imagePrompt and imageSeed on message in Conversation, and NEVER stores image bytes', async () => {
+    it('9.26 image generation stores imagePrompt on message in Conversation (no imageSeed), and NEVER stores image bytes', async () => {
       const origAccount = process.env.CF_ACCOUNT_ID;
       const origToken = process.env.CF_API_TOKEN;
       const origProvider = process.env.IMAGE_PROVIDER;
@@ -3472,8 +3466,7 @@ Diagram of the water cycle
 
         assert.equal(res.status, 200);
         assert.equal(res.body.imagePrompt, studentPrompt);
-        assert.equal(typeof res.body.imageSeed, 'number');
-        assert.ok(res.body.imageSeed >= 0 && res.body.imageSeed <= 4294967295);
+        assert.strictEqual(res.body.imageSeed, undefined, 'API response must not contain imageSeed');
         assert.ok(res.body.conversationId);
 
         // Verify MongoDB Conversation document
@@ -3482,9 +3475,9 @@ Diagram of the water cycle
         assert.equal(conv.messages.length, 2);
         const assistantMsg = conv.messages[1];
 
-        // imagePrompt and imageSeed must be stored
+        // imagePrompt must be stored, imageSeed must not be stored
         assert.equal(assistantMsg.imagePrompt, studentPrompt);
-        assert.equal(assistantMsg.imageSeed, res.body.imageSeed);
+        assert.strictEqual(assistantMsg.imageSeed, undefined, 'Conversation message must not store imageSeed');
 
         // CRITICAL: image bytes must NEVER be stored
         assert.equal(assistantMsg.image, undefined);
@@ -3503,10 +3496,10 @@ Diagram of the water cycle
       }
     });
 
-    it('9.27 GET /api/ask/conversations/:id returns imagePrompt and imageSeed', async () => {
+    it('9.27 GET /api/ask/conversations/:id returns imagePrompt and no imageSeed', async () => {
       const conv = await Conversation.create({
         user: genImgUser._id,
-        title: 'Test Stored Seed Conversation',
+        title: 'Test Stored Prompt Conversation',
         messages: [
           { role: 'user', content: 'Draw a plant cell', mode: 'image' },
           {
@@ -3515,7 +3508,6 @@ Diagram of the water cycle
             mode: 'image',
             generatedImage: true,
             imagePrompt: 'Draw a plant cell',
-            imageSeed: 987654321,
             keyParts: ['Cell Wall: Cellulose barrier', 'Vacuole: Central storage'],
           },
         ],
@@ -3531,13 +3523,13 @@ Diagram of the water cycle
         assert.equal(res.body.messages.length, 2);
         const assistantMsg = res.body.messages[1];
         assert.equal(assistantMsg.imagePrompt, 'Draw a plant cell');
-        assert.equal(assistantMsg.imageSeed, 987654321);
+        assert.strictEqual(assistantMsg.imageSeed, undefined, 'API response must not return imageSeed');
       } finally {
         await Conversation.deleteOne({ _id: conv._id });
       }
     });
 
-    it('9.28 POST /api/ask regenerate reuses stored imagePrompt and imageSeed, ignores client prompt/seed overrides, and bytes never stored', async () => {
+    it('9.28 POST /api/ask regenerate reuses stored imagePrompt, request body has no seed, ignores client prompt/seed overrides, and bytes never stored', async () => {
       const origAccount = process.env.CF_ACCOUNT_ID;
       const origToken = process.env.CF_API_TOKEN;
       const origProvider = process.env.IMAGE_PROVIDER;
@@ -3550,7 +3542,6 @@ Diagram of the water cycle
       await GlobalImageUsage.deleteMany({ date: today });
 
       const storedPrompt = 'Draw mitochondria inner membrane';
-      const storedSeed = 42424242;
 
       const conv = await Conversation.create({
         user: genImgUser._id,
@@ -3563,7 +3554,6 @@ Diagram of the water cycle
             mode: 'image',
             generatedImage: true,
             imagePrompt: storedPrompt,
-            imageSeed: storedSeed,
             keyParts: ['Cristae: Infolded inner membrane folds'],
           },
         ],
@@ -3605,12 +3595,13 @@ Diagram of the water cycle
         assert.equal(res.status, 200);
         assert.ok(res.body.image);
         assert.equal(res.body.imagePrompt, storedPrompt);
-        assert.equal(res.body.imageSeed, storedSeed);
+        assert.strictEqual(res.body.imageSeed, undefined, 'API response must not return imageSeed');
 
-        // Verify provider request body sent the EXACT stored prompt and seed, NOT client overrides
+        // Verify provider request body sent the EXACT stored prompt, NOT client overrides
         assert.ok(capturedBody);
-        assert.equal(capturedBody.seed, storedSeed, 'Must use stored imageSeed');
-        assert.notEqual(capturedBody.seed, 999999999, 'Must not trust client seed override');
+        assert.strictEqual(capturedBody.seed, undefined, 'Request body must not contain seed');
+        assert.strictEqual('seed' in capturedBody, false, 'No seed property in capturedBody');
+        assert.equal(capturedBody.steps, 4);
         assert.ok(capturedBody.prompt.includes('mitochondria inner membrane'), 'Must use stored imagePrompt');
         assert.ok(!capturedBody.prompt.includes('HACKED'), 'Must not trust client prompt override');
 
@@ -3648,7 +3639,6 @@ Diagram of the water cycle
             mode: 'image',
             generatedImage: true,
             imagePrompt: 'Draw a nucleus',
-            imageSeed: 111222,
           },
         ],
       });
@@ -3708,7 +3698,6 @@ Diagram of the water cycle
             mode: 'image',
             generatedImage: true,
             imagePrompt: 'Draw ribosome',
-            imageSeed: 55555,
           },
         ],
       });

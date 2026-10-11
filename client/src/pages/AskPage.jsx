@@ -445,7 +445,6 @@ const AskPage = () => {
         note: note || '',
         keyParts: res.data.keyParts || [],
         imagePrompt: res.data.imagePrompt || effectiveQuestion,
-        imageSeed: res.data.imageSeed,
         _id: res.data.messageId || undefined,
         mode: actualResolvedMode,
         chosenMode: selectedMode,
@@ -626,7 +625,6 @@ const AskPage = () => {
                 image: res.data.image,
                 caption: res.data.caption || m.caption,
                 imagePrompt: res.data.imagePrompt || m.imagePrompt,
-                imageSeed: res.data.imageSeed !== undefined ? res.data.imageSeed : m.imageSeed,
                 keyParts: res.data.keyParts && res.data.keyParts.length > 0 ? res.data.keyParts : m.keyParts,
                 generatedImage: true,
               };
@@ -636,11 +634,11 @@ const AskPage = () => {
         );
       }
     } catch (err) {
-      console.error('Regenerate exact image error:', err);
+      console.error('Regenerate image error:', err);
       const rawMsg =
         err.response?.data?.message ||
         err.message ||
-        'Failed to regenerate exact image. Please try again.';
+        'Failed to regenerate image. Please try again.';
       setError(typeof rawMsg === 'string' ? rawMsg : JSON.stringify(rawMsg));
     } finally {
       setRegeneratingMsgId(null);
@@ -1023,7 +1021,7 @@ const AskPage = () => {
                               </div>
 
                               <p className="text-[11px] text-slate-500 dark:text-slate-400 italic">
-                                Regenerating uses 1 of your 5 daily images. The result may differ slightly.
+                                Regenerating uses 1 of your 5 daily images. You will get a new variation, not the same picture.
                               </p>
 
                               <div className="pt-1 flex flex-wrap items-center gap-2">
@@ -1031,17 +1029,17 @@ const AskPage = () => {
                                   onClick={() => handleRegenerateExactImage(msgId)}
                                   disabled={loading || regeneratingMsgId === msgId}
                                   className="px-3.5 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white font-medium text-xs flex items-center space-x-1.5 shadow-sm transition-all"
-                                  title="Regenerate exact image using stored seed"
+                                  title="Regenerate (new variation)"
                                 >
                                   {regeneratingMsgId === msgId ? (
                                     <>
                                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                      <span>Regenerating exact image...</span>
+                                      <span>Regenerating (new variation)...</span>
                                     </>
                                   ) : (
                                     <>
                                       <RefreshCw className="w-3.5 h-3.5" />
-                                      <span>Regenerate exact image</span>
+                                      <span>Regenerate (new variation)</span>
                                     </>
                                   )}
                                 </button>
@@ -1157,14 +1155,14 @@ const AskPage = () => {
                               <button
                                 onClick={() => handleRegenerateImage(item.imagePrompt || userQuestionText)}
                                 className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium text-xs flex items-center space-x-1.5 transition-colors"
-                                title="Regenerate with a new random seed"
+                                title="Regenerate (new variation)"
                               >
                                 <RefreshCw className="w-3.5 h-3.5" />
                                 <span>Regenerate</span>
                               </button>
 
                               <span className="text-[11px] text-slate-400 dark:text-slate-500 italic ml-1">
-                                Regenerating uses 1 of your 5 daily images. The result may differ slightly.
+                                Regenerating uses 1 of your 5 daily images. You will get a new variation, not the same picture.
                               </span>
                             </div>
                           ) : item.mode === 'svg' || item.svg ? (
