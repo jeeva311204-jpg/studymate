@@ -246,6 +246,19 @@ function sanitizeSvg(rawSvg) {
     finalSvg = finalSvg.replace(new RegExp(`\\b${lower}(?==)`, 'gi'), camel);
   }
 
+  // After sanitizing, if the SVG has no viewBox, add viewBox="0 0 800 600"
+  const svgRootMatch = finalSvg.match(/<svg\b([^>]*)>/i);
+  if (svgRootMatch) {
+    const hasViewBox = /\bviewBox\s*=\s*["'][^"'\s]+[^"']*["']/i.test(svgRootMatch[1]);
+    if (!hasViewBox) {
+      if (/\bviewBox\s*=/i.test(svgRootMatch[1])) {
+        finalSvg = finalSvg.replace(/\bviewBox\s*=\s*["'][^"']*["']/i, 'viewBox="0 0 800 600"');
+      } else {
+        finalSvg = finalSvg.replace(/<svg\b/i, '<svg viewBox="0 0 800 600"');
+      }
+    }
+  }
+
   // Final check on sanitized byte length
   if (Buffer.byteLength(finalSvg, 'utf8') > MAX_SVG_BYTES) {
     return { svg: null, isOversized: true };

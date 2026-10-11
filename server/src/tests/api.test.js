@@ -1727,6 +1727,27 @@ describe('StudyMate API', () => {
         assert.ok(!result.svg.includes('javascript:'), 'Must not contain javascript:');
         assert.ok(result.svg.includes('<circle'), 'Must preserve safe SVG elements');
       });
+
+      it('8.7e adds viewBox="0 0 800 600" if input SVG has no viewBox, and preserves existing viewBox', () => {
+        // Without viewBox: should automatically add viewBox="0 0 800 600"
+        const inputWithout = '<svg xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="20"/></svg>';
+        const resultWithout = sanitizeSvg(inputWithout);
+        assert.ok(resultWithout.svg, 'Sanitized SVG should be returned');
+        assert.ok(resultWithout.svg.includes('viewBox="0 0 800 600"'), 'Sanitized output must contain viewBox="0 0 800 600"');
+
+        // With existing custom viewBox: should preserve custom viewBox
+        const inputWith = '<svg viewBox="0 0 300 150" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="20"/></svg>';
+        const resultWith = sanitizeSvg(inputWith);
+        assert.ok(resultWith.svg, 'Sanitized SVG should be returned');
+        assert.ok(resultWith.svg.includes('viewBox="0 0 300 150"'), 'Existing viewBox must be preserved');
+        assert.ok(!resultWith.svg.includes('viewBox="0 0 800 600"'), 'Default viewBox must not override existing viewBox');
+
+        // Empty viewBox attribute: should replace with viewBox="0 0 800 600"
+        const inputEmpty = '<svg viewBox="" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="20"/></svg>';
+        const resultEmpty = sanitizeSvg(inputEmpty);
+        assert.ok(resultEmpty.svg);
+        assert.ok(resultEmpty.svg.includes('viewBox="0 0 800 600"'));
+      });
     });
 
     // Endpoint Integration Tests
@@ -1926,6 +1947,62 @@ Simple triangle diagram
           assert.equal(messages[1].mode, 'svg');
           assert.ok(messages[1].svg.includes('<polygon'));
           assert.equal(messages[1].description, 'Simple triangle diagram');
+        } finally {
+          mockGetClient.mock.restore();
+          mockFallback.mock.restore();
+        }
+      });
+
+      it('8.13 SVG generation prompt includes all layout rules and ensures viewBox in output when Gemini omits it', async () => {
+        let capturedPrompt = null;
+        const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+        const mockFallback = mock.method(
+          geminiConfig,
+          'generateWithModelFallback',
+          async (prompt) => {
+            capturedPrompt = prompt;
+            // Return an SVG diagram with NO viewBox attribute
+            return `=== DESCRIPTION ===
+Diagram without viewBox
+=== SVG ===
+<svg xmlns="http://www.w3.org/2000/svg">
+  <rect x="50" y="50" width="100" height="40" fill="#4f46e5"/>
+  <text x="70" y="70" fill="#ffffff">Node</text>
+</svg>`;
+          }
+        );
+
+        try {
+          const res = await request(server)
+            .post('/api/ask')
+            .set('Authorization', authSvgUser)
+            .send({
+              question: 'Draw binary search tree',
+              mode: 'svg',
+            });
+
+          assert.equal(res.status, 200);
+          assert.equal(res.body.mode, 'svg');
+
+          // Verify all required SVG prompt rules were passed to Gemini
+          assert.ok(capturedPrompt, 'Prompt must be passed to Gemini');
+          const lowerPrompt = capturedPrompt.toLowerCase();
+          assert.ok(capturedPrompt.includes('viewBox="0 0 800 600"'), 'Prompt must require viewBox="0 0 800 600"');
+          assert.ok(lowerPrompt.includes('inside x 40..760 and y 40..560'), 'Prompt must require bounds x 40..760 and y 40..560');
+          assert.ok(lowerPrompt.includes('labels in the margins with leader lines'), 'Prompt must require margin labels with leader lines');
+          assert.ok(capturedPrompt.includes('text-anchor="end" for left-side labels and "start" for right-side labels'), 'Prompt must require text-anchor rule');
+          assert.ok(lowerPrompt.includes('never let two labels overlap'), 'Prompt must require no overlapping labels');
+          assert.ok(lowerPrompt.includes('no text longer than 28 characters per line'), 'Prompt must require max 28 chars per line');
+          assert.ok(lowerPrompt.includes('no decorative side panels'), 'Prompt must forbid decorative side panels');
+
+          // Verify sanitized output added viewBox="0 0 800 600"
+          assert.ok(res.body.svg, 'Should return svg');
+          assert.ok(res.body.svg.includes('viewBox="0 0 800 600"'), 'Sanitized output must contain viewBox');
+
+          // Verify saved conversation in MongoDB also contains viewBox="0 0 800 600"
+          const savedConv = await Conversation.findById(res.body.conversationId);
+          assert.ok(savedConv);
+          assert.ok(savedConv.messages[1].svg.includes('viewBox="0 0 800 600"'), 'Stored SVG message must contain viewBox');
         } finally {
           mockGetClient.mock.restore();
           mockFallback.mock.restore();
