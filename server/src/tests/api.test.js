@@ -21,7 +21,7 @@ const geminiConfig = require('../config/gemini');
 const { getKolkataDateString, isImageGenerationRequest, isSvgDiagramRequest, getImageProvider, MAX_STORED_SVG_BYTES } = require('../controllers/askController');
 const { generateGeminiImage, ImageGenError } = require('../utils/geminiImage');
 const { generateCloudflareImage, stripTextAndLabelRequests, NO_TEXT_INSTRUCTION } = require('../utils/cloudflareImage');
-const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
+const { sanitizeSvg, MAX_SVG_BYTES, checkSvgTextBounds } = require('../utils/svgSanitizer');
 
 process.env.PORT = '5001';
 
@@ -1748,6 +1748,48 @@ describe('StudyMate API', () => {
         assert.ok(resultEmpty.svg);
         assert.ok(resultEmpty.svg.includes('viewBox="0 0 800 600"'));
       });
+
+      it('8.7f warns in console.warn when any <text> x attribute is under 20 or over 780, and does not warn when in bounds', () => {
+        const warnings = [];
+        const originalWarn = console.warn;
+        console.warn = (...args) => {
+          warnings.push(args.join(' '));
+        };
+
+        try {
+          // Under 20: should warn
+          warnings.length = 0;
+          const under = '<svg viewBox="0 0 800 600"><text x="15" y="50">Left margin label</text></svg>';
+          const resUnder = sanitizeSvg(under);
+          assert.ok(resUnder.svg);
+          assert.equal(warnings.length, 1, 'Must warn when x < 20');
+          assert.match(warnings[0], /<text>.*x.*(?:under 20|15)/i);
+
+          // Over 780: should warn
+          warnings.length = 0;
+          const over = '<svg viewBox="0 0 800 600"><text x="790" y="50">Right margin label</text></svg>';
+          const resOver = sanitizeSvg(over);
+          assert.ok(resOver.svg);
+          assert.equal(warnings.length, 1, 'Must warn when x > 780');
+          assert.match(warnings[0], /<text>.*x.*(?:over 780|790)/i);
+
+          // Within bounds: exactly 20, 400, 780 should not warn
+          warnings.length = 0;
+          const within = '<svg viewBox="0 0 800 600"><text x="20" y="50">Min</text><text x="400" y="300">Center</text><text x="780" y="50">Max</text></svg>';
+          const resWithin = sanitizeSvg(within);
+          assert.ok(resWithin.svg);
+          assert.equal(warnings.length, 0, 'Must NOT warn when x is between 20 and 780');
+
+          // No text element: should not warn
+          warnings.length = 0;
+          const noText = '<svg viewBox="0 0 800 600"><rect x="50" y="50" width="100" height="100"/></svg>';
+          const resNoText = sanitizeSvg(noText);
+          assert.ok(resNoText.svg);
+          assert.equal(warnings.length, 0, 'Must NOT warn when SVG has no <text>');
+        } finally {
+          console.warn = originalWarn;
+        }
+      });
     });
 
     // Endpoint Integration Tests
@@ -1988,11 +2030,14 @@ Diagram without viewBox
           assert.ok(capturedPrompt, 'Prompt must be passed to Gemini');
           const lowerPrompt = capturedPrompt.toLowerCase();
           assert.ok(capturedPrompt.includes('viewBox="0 0 800 600"'), 'Prompt must require viewBox="0 0 800 600"');
-          assert.ok(lowerPrompt.includes('inside x 40..760 and y 40..560'), 'Prompt must require bounds x 40..760 and y 40..560');
+          assert.ok(lowerPrompt.includes('put the drawing in the centre (x 220..580)'), 'Prompt must require drawing in centre x 220..580');
+          assert.ok(lowerPrompt.includes('right-side labels must start at x <= 600 and be at most 20 characters'), 'Prompt must require right-side label rule');
+          assert.ok(lowerPrompt.includes('left-side labels must end at x >= 200 and be at most 20 characters'), 'Prompt must require left-side label rule');
+          assert.ok(lowerPrompt.includes('use font-size 14 for labels'), 'Prompt must require font-size 14 for labels');
+          assert.ok(lowerPrompt.includes('split long names over two <text> lines'), 'Prompt must require splitting long names over two lines');
           assert.ok(lowerPrompt.includes('labels in the margins with leader lines'), 'Prompt must require margin labels with leader lines');
           assert.ok(capturedPrompt.includes('text-anchor="end" for left-side labels and "start" for right-side labels'), 'Prompt must require text-anchor rule');
           assert.ok(lowerPrompt.includes('never let two labels overlap'), 'Prompt must require no overlapping labels');
-          assert.ok(lowerPrompt.includes('no text longer than 28 characters per line'), 'Prompt must require max 28 chars per line');
           assert.ok(lowerPrompt.includes('no decorative side panels'), 'Prompt must forbid decorative side panels');
 
           // Verify sanitized output added viewBox="0 0 800 600"
@@ -2004,6 +2049,52 @@ Diagram without viewBox
           assert.ok(savedConv);
           assert.ok(savedConv.messages[1].svg.includes('viewBox="0 0 800 600"'), 'Stored SVG message must contain viewBox');
         } finally {
+          mockGetClient.mock.restore();
+          mockFallback.mock.restore();
+        }
+      });
+
+      it('8.14 logs a warning when Gemini SVG has <text> x under 20 or over 780 during POST /api/ask', async () => {
+        const warnings = [];
+        const originalWarn = console.warn;
+        console.warn = (...args) => {
+          warnings.push(args.join(' '));
+        };
+
+        const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+        const mockFallback = mock.method(
+          geminiConfig,
+          'generateWithModelFallback',
+          async () => `=== DESCRIPTION ===
+Diagram with label outside margins
+=== SVG ===
+<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg">
+  <rect x="220" y="100" width="360" height="200" fill="#f1f5f9"/>
+  <text x="10" y="150" font-size="14">Too far left</text>
+  <text x="790" y="150" font-size="14">Too far right</text>
+</svg>`
+        );
+
+        try {
+          const res = await request(server)
+            .post('/api/ask')
+            .set('Authorization', authSvgUser)
+            .send({
+              question: 'Draw a system architecture diagram',
+              mode: 'svg',
+            });
+
+          assert.equal(res.status, 200);
+          assert.equal(res.body.mode, 'svg');
+          assert.ok(res.body.svg);
+
+          // Verify console.warn was called for both out-of-bounds text elements
+          const boundsWarnings = warnings.filter((w) => w.includes('[SVG text bounds warning]'));
+          assert.ok(boundsWarnings.length >= 1, 'Must log warning when text x is out of bounds');
+          assert.ok(boundsWarnings.some((w) => w.includes('10')), 'Must warn about x=10');
+          assert.ok(boundsWarnings.some((w) => w.includes('790')), 'Must warn about x=790');
+        } finally {
+          console.warn = originalWarn;
           mockGetClient.mock.restore();
           mockFallback.mock.restore();
         }

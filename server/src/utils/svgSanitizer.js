@@ -259,6 +259,9 @@ function sanitizeSvg(rawSvg) {
     }
   }
 
+  // After sanitizing, check text bounds and warn if any <text> x attribute is under 20 or over 780
+  checkSvgTextBounds(finalSvg);
+
   // Final check on sanitized byte length
   if (Buffer.byteLength(finalSvg, 'utf8') > MAX_SVG_BYTES) {
     return { svg: null, isOversized: true };
@@ -267,7 +270,37 @@ function sanitizeSvg(rawSvg) {
   return { svg: finalSvg, isOversized: false };
 }
 
+/**
+ * Server-side check that warns in the logs (console.warn) when any <text> x attribute is under 20 or over 780.
+ *
+ * @param {string} svgContent - SVG string
+ * @returns {boolean} Whether any text element had an out-of-bounds x attribute
+ */
+function checkSvgTextBounds(svgContent) {
+  if (!svgContent || typeof svgContent !== 'string') return false;
+  let hasOutOfBounds = false;
+  const textTagMatches = svgContent.matchAll(/<text\b([^>]*)>/gi);
+  for (const match of textTagMatches) {
+    const attrs = match[1];
+    const xMatch = attrs.match(/(?:^|\s)x\s*=\s*(?:["']([^"']+)["']|([^\s>]+))/i);
+    if (xMatch) {
+      const rawVal = xMatch[1] || xMatch[2];
+      const coords = rawVal.trim().split(/[\s,]+/);
+      for (const coord of coords) {
+        const val = parseFloat(coord);
+        if (!isNaN(val) && (val < 20 || val > 780)) {
+          console.warn(`[SVG text bounds warning] <text> x attribute is under 20 or over 780: ${val}`);
+          hasOutOfBounds = true;
+          break;
+        }
+      }
+    }
+  }
+  return hasOutOfBounds;
+}
+
 module.exports = {
   sanitizeSvg,
   MAX_SVG_BYTES,
+  checkSvgTextBounds,
 };

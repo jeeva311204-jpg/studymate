@@ -6,7 +6,8 @@
     "server": "npm --prefix server run dev",
     "client": "npm --prefix client run dev",
     "install:all": "npm --prefix server install && npm --prefix client install",
-    "build:client": "npm --prefix client run build"
+    "build:client": "npm --prefix client run build",
+    "test": "npm --prefix server test"
   },
   "keywords": [
     "ai",

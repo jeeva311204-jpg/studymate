@@ -4,7 +4,7 @@ const AskUsage = require('../models/AskUsage');
 const GlobalImageUsage = require('../models/GlobalImageUsage');
 const Conversation = require('../models/Conversation');
 const geminiConfig = require('../config/gemini');
-const { sanitizeSvg, MAX_SVG_BYTES } = require('../utils/svgSanitizer');
+const { sanitizeSvg, MAX_SVG_BYTES, checkSvgTextBounds } = require('../utils/svgSanitizer');
 const { generateGeminiImage, ImageGenError } = require('../utils/geminiImage');
 const { generateCloudflareImage, buildEducationalPrompt, stripTextAndLabelRequests, NO_TEXT_INSTRUCTION } = require('../utils/cloudflareImage');
 
@@ -39,7 +39,7 @@ const MODE_PROMPT_INSTRUCTIONS = {
   short_notes: 'Format requirements: Provide concise bullet points optimized for fast exam revision and memory retention.',
   simple: 'Format requirements: Provide a beginner-friendly, plain-language explanation using an intuitive real-world analogy so anyone can understand the concept effortlessly.',
   auto: 'Format requirements: Analyze the question to determine the most appropriate academic format (one of: doubt, mark2, mark8, mark16, short_notes, simple). On the very first line of your response, write "[MODE: <chosen_mode>]" (e.g. [MODE: doubt] or [MODE: mark2]), and then provide the complete answer tailored to that mode.',
-  svg: 'Format requirements: You must generate a diagram for the student as a single valid, self-contained SVG, plus a one-line description in a separate field.\nReturn ONLY two sections formatted EXACTLY like this:\n=== DESCRIPTION ===\n<one-line plain text description of the diagram>\n=== SVG ===\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600">\n...\n</svg>\n\nCRITICAL RULES:\n1. Must be a single valid, self-contained SVG with viewBox="0 0 800 600".\n2. Keep every shape and text inside x 40..760 and y 40..560.\n3. Put labels in the margins with leader lines.\n4. Use text-anchor="end" for left-side labels and "start" for right-side labels.\n5. Never let two labels overlap.\n6. No text longer than 28 characters per line.\n7. No decorative side panels.\n8. Absolutely NO external resources, NO <script>, NO <foreignObject>, NO <iframe>, and NO <img>/<image> tags.\n9. Clean, clearly readable text labels with dark/light contrast.\n10. Simple, clean styling.\n11. Output raw SVG directly under === SVG === without markdown code fences.',
+  svg: 'Format requirements: You must generate a diagram for the student as a single valid, self-contained SVG, plus a one-line description in a separate field.\nReturn ONLY two sections formatted EXACTLY like this:\n=== DESCRIPTION ===\n<one-line plain text description of the diagram>\n=== SVG ===\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600">\n...\n</svg>\n\nCRITICAL RULES:\n1. Must be a single valid, self-contained SVG with viewBox="0 0 800 600".\n2. Put the drawing in the centre (x 220..580). Keep every shape and text inside x 40..760 and y 40..560.\n3. Put labels in the margins with leader lines: left-side labels must end at x >= 200 and be at most 20 characters; right-side labels must start at x <= 600 and be at most 20 characters. Use text-anchor="end" for left-side labels and "start" for right-side labels.\n4. Use font-size 14 for labels.\n5. Split long names over two <text> lines.\n6. Never let two labels overlap.\n7. No decorative side panels.\n8. Absolutely NO external resources, NO <script>, NO <foreignObject>, NO <iframe>, and NO <img>/<image> tags.\n9. Clean, clearly readable text labels with dark/light contrast.\n10. Simple, clean styling.\n11. Output raw SVG directly under === SVG === without markdown code fences.',
 };
 
 /**
@@ -373,11 +373,11 @@ Return ONLY two sections formatted EXACTLY like this:
 
 CRITICAL RULES:
 1. Must be a single valid, self-contained SVG with viewBox="0 0 800 600".
-2. Keep every shape and text inside x 40..760 and y 40..560.
-3. Put labels in the margins with leader lines.
-4. Use text-anchor="end" for left-side labels and "start" for right-side labels.
-5. Never let two labels overlap.
-6. No text longer than 28 characters per line.
+2. Put the drawing in the centre (x 220..580). Keep every shape and text inside x 40..760 and y 40..560.
+3. Put labels in the margins with leader lines: left-side labels must end at x >= 200 and be at most 20 characters; right-side labels must start at x <= 600 and be at most 20 characters. Use text-anchor="end" for left-side labels and "start" for right-side labels.
+4. Use font-size 14 for labels.
+5. Split long names over two <text> lines.
+6. Never let two labels overlap.
 7. No decorative side panels.
 8. Absolutely NO external resources, NO <script>, NO <foreignObject>, NO <iframe>, and NO <img>/<image> tags.
 9. Clean, clearly readable text labels with dark/light contrast.
@@ -397,7 +397,7 @@ Student Question:
         rawFallbackAnswer = `=== DESCRIPTION ===
 Diagram for ${q.slice(0, 40)}
 === SVG ===
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600"><rect x="40" y="40" width="720" height="520" fill="#f8fafc" stroke="#cbd5e1"/><text x="400" y="300" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#334155">${q.slice(0, 28)}</text></svg>`;
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600"><rect x="40" y="40" width="720" height="520" fill="#f8fafc" stroke="#cbd5e1"/><text x="400" y="300" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#334155">${q.slice(0, 20)}</text></svg>`;
       }
 
       let desc = 'Educational diagram';
@@ -410,7 +410,7 @@ Diagram for ${q.slice(0, 40)}
       if (sMatch) {
         rawSvgContent = sMatch[0];
       } else {
-        rawSvgContent = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600"><rect x="40" y="40" width="720" height="520" fill="#f8fafc" stroke="#cbd5e1"/><text x="400" y="300" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#334155">${q.slice(0, 28)}</text></svg>`;
+        rawSvgContent = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 600"><rect x="40" y="40" width="720" height="520" fill="#f8fafc" stroke="#cbd5e1"/><text x="400" y="300" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#334155">${q.slice(0, 20)}</text></svg>`;
       }
 
       const sResult = sanitizeSvg(rawSvgContent);
@@ -1293,3 +1293,5 @@ exports.stripTextAndLabelRequests = stripTextAndLabelRequests;
 exports.NO_TEXT_INSTRUCTION = NO_TEXT_INSTRUCTION;
 exports.buildEducationalPrompt = buildEducationalPrompt;
 exports.buildImagePrompt = buildEducationalPrompt;
+exports.checkSvgTextBounds = checkSvgTextBounds;
+exports.MODE_PROMPT_INSTRUCTIONS = MODE_PROMPT_INSTRUCTIONS;
