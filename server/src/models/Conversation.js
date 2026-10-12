@@ -37,6 +37,10 @@ const messageSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    fallbackReason: {
+      type: String,
+      default: null,
+    },
     keyParts: {
       type: [String],
       default: undefined,

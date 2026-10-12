@@ -3212,6 +3212,7 @@ Fallback Diagram of Water Molecule
         if (origModel) process.env.GEMINI_IMAGE_MODEL = origModel;
         if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
         if (origCap) process.env.IMAGE_DAILY_GLOBAL_CAP = origCap;
+        else delete process.env.IMAGE_DAILY_GLOBAL_CAP;
       }
     });
 
@@ -3257,6 +3258,8 @@ Fallback Diagram of Water Molecule
     it('9.21 12 parallel image requests: exactly 5 succeed and 7 receive 429 rate limit', async () => {
       const origModel = process.env.GEMINI_IMAGE_MODEL;
       const origProvider = process.env.IMAGE_PROVIDER;
+      const origCap = process.env.IMAGE_DAILY_GLOBAL_CAP;
+      delete process.env.IMAGE_DAILY_GLOBAL_CAP;
       process.env.IMAGE_PROVIDER = 'gemini';
       process.env.GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-lite-image';
       const today = getKolkataDateString();
@@ -3326,6 +3329,11 @@ Fallback Diagram of Water Molecule
         } else {
           delete process.env.IMAGE_PROVIDER;
         }
+        if (origCap) {
+          process.env.IMAGE_DAILY_GLOBAL_CAP = origCap;
+        } else {
+          delete process.env.IMAGE_DAILY_GLOBAL_CAP;
+        }
         await AskUsage.deleteMany({ user: parallelUser._id });
         await GlobalImageUsage.deleteMany({ date: today });
         await User.deleteOne({ _id: parallelUser._id });
@@ -3382,6 +3390,7 @@ Diagram of the water cycle
         assert.ok(res.body.svg);
         assert.match(res.body.svg, /<svg/i);
         assert.equal(res.body.fallback, true);
+        assert.equal(res.body.fallbackReason, 'provider_error');
         assert.equal(res.body.note, 'Image service is busy, here is a diagram instead.');
         assert.ok(res.body.conversationId);
 
@@ -3400,6 +3409,7 @@ Diagram of the water cycle
         assert.ok(conv);
         assert.equal(conv.messages.length, 2);
         assert.equal(conv.messages[1].mode, 'svg');
+        assert.equal(conv.messages[1].fallbackReason, 'provider_error');
         assert.ok(conv.messages[1].svg);
       } finally {
         mockFetch.mock.restore();
@@ -3423,7 +3433,7 @@ Diagram of the water cycle
       }
     });
 
-    it('9.23 image provider request body includes appended no-text instruction and strips label/text requests', async () => {
+    it('9.23 image provider request body includes positive prompt and strips label/caption/text requests without negative wording', async () => {
       const origAccount = process.env.CF_ACCOUNT_ID;
       const origToken = process.env.CF_API_TOKEN;
       process.env.CF_ACCOUNT_ID = 'cf-test-acc';
@@ -3433,6 +3443,7 @@ Diagram of the water cycle
       assert.equal(stripTextAndLabelRequests('draw a plant cell with labels and add text'), 'draw a plant cell');
       assert.equal(stripTextAndLabelRequests('draw a cell, labelled'), 'draw a cell');
       assert.equal(stripTextAndLabelRequests('draw mitochondria and label the parts'), 'draw mitochondria');
+      assert.equal(stripTextAndLabelRequests('draw an eye with caption and labels'), 'draw an eye');
 
       // 2. Integration with generateCloudflareImage: verify fetch body
       let capturedBody = null;
@@ -3452,21 +3463,28 @@ Diagram of the water cycle
       });
 
       try {
-        const studentPrompt = 'Draw an animal cell with labels and add text';
+        const studentPrompt = 'Draw an animal cell with labels, captions, and text';
         const res = await generateCloudflareImage(studentPrompt);
         assert.ok(res.image);
         assert.ok(capturedBody, 'Cloudflare request body must be sent');
         assert.equal(capturedBody.steps, 4);
 
-        // Verify no-text instruction appended
-        assert.ok(
-          capturedBody.prompt.includes('Clean illustration, no text, no letters, no words, no labels, no captions, no watermark.'),
-          'Prompt must contain appended no-text instruction'
+        // Verify positive prompt wording
+        assert.equal(
+          capturedBody.prompt,
+          'Simple clean educational illustration of Draw an animal cell, plain pale background, single centred object, flat colours, no extra decoration.'
         );
 
-        // Verify label and add text requests stripped
-        assert.ok(!capturedBody.prompt.toLowerCase().includes('with labels'), 'Prompt must strip "with labels"');
-        assert.ok(!capturedBody.prompt.toLowerCase().includes('add text'), 'Prompt must strip "add text"');
+        // Verify none of the words "text", "letters", "words", "labels", "captions", "watermark" appear in the request body
+        const rawBody = JSON.stringify(capturedBody);
+        const forbiddenWords = ['text', 'letters', 'words', 'labels', 'captions', 'watermark'];
+        for (const word of forbiddenWords) {
+          const regex = new RegExp(`\\b${word}\\b`, 'i');
+          assert.ok(
+            !regex.test(rawBody),
+            `Request body must not contain the word "${word}". Found in: ${rawBody}`
+          );
+        }
       } finally {
         mockFetch.mock.restore();
         if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
@@ -3530,10 +3548,15 @@ Diagram of the water cycle
         assert.match(res.body.keyParts[0], /Nucleus/i);
         assert.match(res.body.keyParts[1], /Mitochondria/i);
 
-        // Verify Cloudflare request body had the no-text instruction and stripped "with labels"
+        // Verify Cloudflare request body had positive prompt and stripped "with labels"
         assert.ok(capturedImageBody);
-        assert.ok(capturedImageBody.prompt.includes('Clean illustration, no text, no letters, no words, no labels, no captions, no watermark.'));
+        assert.ok(capturedImageBody.prompt.startsWith('Simple clean educational illustration of'));
+        assert.ok(capturedImageBody.prompt.includes('plain pale background, single centred object, flat colours, no extra decoration.'));
         assert.ok(!capturedImageBody.prompt.toLowerCase().includes('with labels'));
+        const rawImageBody = JSON.stringify(capturedImageBody);
+        for (const word of ['text', 'letters', 'words', 'labels', 'captions', 'watermark']) {
+          assert.ok(!new RegExp(`\\b${word}\\b`, 'i').test(rawImageBody), `Request body must not contain "${word}"`);
+        }
 
         // Verify conversation persistence
         const conv = await Conversation.findById(res.body.conversationId);
@@ -3934,6 +3957,293 @@ Diagram of the water cycle
       } finally {
         await Conversation.deleteOne({ _id: conv._id });
         await AskUsage.deleteMany({ user: genImgUser._id, date: today });
+        await GlobalImageUsage.deleteMany({ date: today });
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+        else delete process.env.IMAGE_PROVIDER;
+      }
+    });
+
+    it('9.31 GET /api/ask/capabilities returns imagesUsedToday and imageDailyLimit', async () => {
+      const today = getKolkataDateString();
+      await AskUsage.deleteMany({ user: genImgUser._id, date: today });
+
+      // Initially 0 images used
+      const res0 = await request(server)
+        .get('/api/ask/capabilities')
+        .set('Authorization', authGenImgUser);
+      assert.equal(res0.status, 200);
+      assert.equal(res0.body.imagesUsedToday, 0);
+      assert.equal(res0.body.imageDailyLimit, 5);
+
+      // Seed usage to 3 images used
+      await AskUsage.findOneAndUpdate(
+        { user: genImgUser._id, date: today },
+        { count: 3, imageCount: 3 },
+        { upsert: true }
+      );
+
+      const res3 = await request(server)
+        .get('/api/ask/capabilities')
+        .set('Authorization', authGenImgUser);
+      assert.equal(res3.status, 200);
+      assert.equal(res3.body.imagesUsedToday, 3);
+      assert.equal(res3.body.imageDailyLimit, 5);
+
+      await AskUsage.deleteMany({ user: genImgUser._id, date: today });
+    });
+
+    it('9.32 user cap reached returns SVG fallback with user_cap reason code and does not consume slot', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'cloudflare';
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+      const today = getKolkataDateString();
+
+      const userCapUser = await User.create({
+        name: 'UserCap Test Student',
+        email: `user_cap_${Date.now()}@test.edu`,
+        password: 'password123',
+      });
+      const authUserCapUser = `Bearer ${jwt.sign({ id: userCapUser._id }, getJwtSecret(), { expiresIn: '1h' })}`;
+
+      // Seed user usage to cap (5 images used)
+      await AskUsage.findOneAndUpdate(
+        { user: userCapUser._id, date: today },
+        { count: 5, imageCount: 5 },
+        { upsert: true }
+      );
+      await GlobalImageUsage.deleteMany({ date: today });
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => `=== DESCRIPTION ===
+Diagram of chloroplast
+=== SVG ===
+<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><rect width="800" height="600" fill="#f0fdf4"/><text x="400" y="300" text-anchor="middle" font-size="14" fill="#166534">Chloroplast Diagram</text></svg>`
+      );
+
+      let createdConvId = null;
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authUserCapUser)
+          .send({
+            question: 'draw a chloroplast',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 200, 'Must return 200 SVG fallback instead of 429 error');
+        assert.equal(res.body.mode, 'svg');
+        assert.equal(res.body.resolvedMode, 'svg');
+        assert.equal(res.body.fallback, true);
+        assert.equal(res.body.fallbackReason, 'user_cap');
+        assert.equal(
+          res.body.note,
+          "You've used all 5 image generations for today. They reset at midnight (IST). Here is a diagram instead."
+        );
+        assert.ok(res.body.svg);
+        assert.ok(res.body.conversationId);
+        createdConvId = res.body.conversationId;
+
+        // Verify image slot was NOT consumed (remains 5, not incremented to 6)
+        const usageAfter = await AskUsage.findOne({ user: userCapUser._id, date: today });
+        assert.equal(usageAfter?.imageCount, 5, 'imageCount must not increment when SVG fallback is returned');
+
+        // Verify conversation saved message has fallbackReason
+        const conv = await Conversation.findById(res.body.conversationId);
+        assert.ok(conv);
+        assert.equal(conv.messages[1].fallbackReason, 'user_cap');
+        assert.equal(
+          conv.messages[1].note,
+          "You've used all 5 image generations for today. They reset at midnight (IST). Here is a diagram instead."
+        );
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+        if (createdConvId) await Conversation.deleteOne({ _id: createdConvId });
+        await AskUsage.deleteMany({ user: userCapUser._id, date: today });
+        await User.deleteOne({ _id: userCapUser._id });
+        await GlobalImageUsage.deleteMany({ date: today });
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+        else delete process.env.IMAGE_PROVIDER;
+      }
+    });
+
+    it('9.33 global cap reached returns SVG fallback with global_cap reason code and does not consume slot', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      const origCap = process.env.IMAGE_DAILY_GLOBAL_CAP;
+      process.env.IMAGE_PROVIDER = 'cloudflare';
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+      process.env.IMAGE_DAILY_GLOBAL_CAP = '10';
+      const today = getKolkataDateString();
+
+      const globalCapUser = await User.create({
+        name: 'GlobalCap Test Student',
+        email: `global_cap_${Date.now()}@test.edu`,
+        password: 'password123',
+      });
+      const authGlobalCapUser = `Bearer ${jwt.sign({ id: globalCapUser._id }, getJwtSecret(), { expiresIn: '1h' })}`;
+
+      // Seed GlobalImageUsage to cap
+      await GlobalImageUsage.findOneAndUpdate(
+        { date: today },
+        { count: 10 },
+        { upsert: true, new: true }
+      );
+      await AskUsage.deleteMany({ user: globalCapUser._id, date: today });
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => `=== DESCRIPTION ===
+Diagram of animal cell
+=== SVG ===
+<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><rect width="800" height="600" fill="#f8fafc"/><text x="400" y="300" text-anchor="middle" font-size="14" fill="#0f172a">Animal Cell Diagram</text></svg>`
+      );
+
+      let createdConvId = null;
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authGlobalCapUser)
+          .send({
+            question: 'draw an animal cell',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 200, 'Must return 200 SVG fallback instead of 429 error');
+        assert.equal(res.body.mode, 'svg');
+        assert.equal(res.body.resolvedMode, 'svg');
+        assert.equal(res.body.fallback, true);
+        assert.equal(res.body.fallbackReason, 'global_cap');
+        assert.equal(
+          res.body.note,
+          'Image generation is paused for today because the free daily limit was reached. Here is a diagram instead.'
+        );
+        assert.ok(res.body.svg);
+        assert.ok(res.body.conversationId);
+        createdConvId = res.body.conversationId;
+
+        // Verify image slot was NOT consumed
+        const usageAfter = await AskUsage.findOne({ user: globalCapUser._id, date: today });
+        assert.equal(usageAfter?.imageCount || 0, 0, 'imageCount must remain 0');
+
+        // Verify conversation saved message has fallbackReason
+        const conv = await Conversation.findById(res.body.conversationId);
+        assert.ok(conv);
+        assert.equal(conv.messages[1].fallbackReason, 'global_cap');
+        assert.equal(
+          conv.messages[1].note,
+          'Image generation is paused for today because the free daily limit was reached. Here is a diagram instead.'
+        );
+      } finally {
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+        if (createdConvId) await Conversation.deleteOne({ _id: createdConvId });
+        await AskUsage.deleteMany({ user: globalCapUser._id, date: today });
+        await User.deleteOne({ _id: globalCapUser._id });
+        await GlobalImageUsage.deleteMany({ date: today });
+        if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
+        else delete process.env.CF_ACCOUNT_ID;
+        if (origToken) process.env.CF_API_TOKEN = origToken;
+        else delete process.env.CF_API_TOKEN;
+        if (origProvider) process.env.IMAGE_PROVIDER = origProvider;
+        else delete process.env.IMAGE_PROVIDER;
+        if (origCap) process.env.IMAGE_DAILY_GLOBAL_CAP = origCap;
+        else delete process.env.IMAGE_DAILY_GLOBAL_CAP;
+      }
+    });
+
+    it('9.34 provider error returns SVG fallback with provider_error reason code and refunds slot', async () => {
+      const origAccount = process.env.CF_ACCOUNT_ID;
+      const origToken = process.env.CF_API_TOKEN;
+      const origProvider = process.env.IMAGE_PROVIDER;
+      process.env.IMAGE_PROVIDER = 'cloudflare';
+      process.env.CF_ACCOUNT_ID = 'cf-test-acc';
+      process.env.CF_API_TOKEN = 'cf-test-tok';
+      const today = getKolkataDateString();
+
+      const providerErrUser = await User.create({
+        name: 'ProviderErr Test Student',
+        email: `provider_err_${Date.now()}@test.edu`,
+        password: 'password123',
+      });
+      const authProviderErrUser = `Bearer ${jwt.sign({ id: providerErrUser._id }, getJwtSecret(), { expiresIn: '1h' })}`;
+
+      await AskUsage.deleteMany({ user: providerErrUser._id, date: today });
+      await GlobalImageUsage.deleteMany({ date: today });
+
+      // Simulate provider failure
+      const mockFetch = mock.method(global, 'fetch', async () => ({
+        ok: false,
+        status: 503,
+        json: async () => ({
+          errors: [{ code: 10009, message: 'Cloudflare service unavailable' }],
+        }),
+      }));
+
+      const mockGetClient = mock.method(geminiConfig, 'getGeminiClient', () => ({}));
+      const mockFallback = mock.method(
+        geminiConfig,
+        'generateWithModelFallback',
+        async () => `=== DESCRIPTION ===
+Diagram of mitochondria
+=== SVG ===
+<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg"><rect width="800" height="600" fill="#f8fafc"/><text x="400" y="300" text-anchor="middle" font-size="14" fill="#0f172a">Mitochondria Diagram</text></svg>`
+      );
+
+      let createdConvId = null;
+      try {
+        const res = await request(server)
+          .post('/api/ask')
+          .set('Authorization', authProviderErrUser)
+          .send({
+            question: 'draw a mitochondria',
+            mode: 'image',
+          });
+
+        assert.equal(res.status, 200, 'Must return 200 SVG fallback instead of 503 error');
+        assert.equal(res.body.mode, 'svg');
+        assert.equal(res.body.resolvedMode, 'svg');
+        assert.equal(res.body.fallback, true);
+        assert.equal(res.body.fallbackReason, 'provider_error');
+        assert.equal(res.body.note, 'Image service is busy, here is a diagram instead.');
+        assert.ok(res.body.svg);
+        assert.ok(res.body.conversationId);
+        createdConvId = res.body.conversationId;
+
+        // Verify image slot was refunded and is not consumed
+        const usageAfter = await AskUsage.findOne({ user: providerErrUser._id, date: today });
+        assert.equal(usageAfter?.imageCount || 0, 0, 'imageCount must be refunded to 0');
+
+        // Verify conversation saved message has fallbackReason
+        const conv = await Conversation.findById(res.body.conversationId);
+        assert.ok(conv);
+        assert.equal(conv.messages[1].fallbackReason, 'provider_error');
+        assert.equal(conv.messages[1].note, 'Image service is busy, here is a diagram instead.');
+      } finally {
+        mockFetch.mock.restore();
+        mockGetClient.mock.restore();
+        mockFallback.mock.restore();
+        if (createdConvId) await Conversation.deleteOne({ _id: createdConvId });
+        await AskUsage.deleteMany({ user: providerErrUser._id, date: today });
+        await User.deleteOne({ _id: providerErrUser._id });
         await GlobalImageUsage.deleteMany({ date: today });
         if (origAccount) process.env.CF_ACCOUNT_ID = origAccount;
         else delete process.env.CF_ACCOUNT_ID;

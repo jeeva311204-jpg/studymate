@@ -36,6 +36,12 @@ import {
   ListChecks,
 } from 'lucide-react';
 
+const FALLBACK_MESSAGES = {
+  user_cap: "You've used all 5 image generations for today. They reset at midnight (IST). Here is a diagram instead.",
+  global_cap: "Image generation is paused for today because the free daily limit was reached. Here is a diagram instead.",
+  provider_error: "Image service is busy, here is a diagram instead.",
+};
+
 const MODES = [
   {
     id: 'auto',
@@ -169,17 +175,18 @@ const AskPage = () => {
   const messagesEndRef = useRef(null);
 
   // Fetch AI capabilities (checks if image generation is supported/configured)
-  useEffect(() => {
-    const fetchCapabilities = async () => {
-      try {
-        const res = await api.get('/ask/capabilities');
-        if (res.data) {
-          setCapabilities(res.data);
-        }
-      } catch (err) {
-        console.error('Failed to load capabilities:', err);
+  const fetchCapabilities = async () => {
+    try {
+      const res = await api.get('/ask/capabilities');
+      if (res.data) {
+        setCapabilities(res.data);
       }
-    };
+    } catch (err) {
+      console.error('Failed to load capabilities:', err);
+    }
+  };
+
+  useEffect(() => {
     fetchCapabilities();
   }, []);
 
@@ -435,6 +442,9 @@ const AskPage = () => {
         noteTitle: userNotes.find((n) => n._id === selectedNoteId)?.title || null,
       };
 
+      const fallbackReason = res.data.fallbackReason || null;
+      const noteMsg = res.data.note || (fallbackReason ? FALLBACK_MESSAGES[fallbackReason] : '');
+
       const newAiMsg = {
         role: 'assistant',
         content: answer || caption || svg || '',
@@ -442,7 +452,8 @@ const AskPage = () => {
         image: image || null,
         caption: caption || '',
         description: description || '',
-        note: note || '',
+        note: noteMsg || '',
+        fallbackReason: fallbackReason,
         keyParts: res.data.keyParts || [],
         imagePrompt: res.data.imagePrompt || effectiveQuestion,
         _id: res.data.messageId || undefined,
@@ -461,6 +472,7 @@ const AskPage = () => {
 
       // Refresh conversations list to update sidebar order & titles
       fetchConversations();
+      fetchCapabilities();
     } catch (err) {
       console.error('Ask AI error:', err);
       const rawMsg =
@@ -632,6 +644,7 @@ const AskPage = () => {
             return m;
           })
         );
+        fetchCapabilities();
       }
     } catch (err) {
       console.error('Regenerate image error:', err);
@@ -1056,7 +1069,17 @@ const AskPage = () => {
                               <ul className="space-y-1 text-xs text-slate-700 dark:text-slate-300 list-disc list-inside">
                                 {item.keyParts.map((part, idx) => (
                                   <li key={idx} className="leading-relaxed">
-                                    {part}
+                                    <ReactMarkdown
+                                      remarkPlugins={[remarkGfm]}
+                                      components={{
+                                        p: ({ node, ...props }) => <span {...props} />,
+                                        strong: ({ node, ...props }) => (
+                                          <strong className="font-semibold text-slate-900 dark:text-slate-100" {...props} />
+                                        ),
+                                      }}
+                                    >
+                                      {part}
+                                    </ReactMarkdown>
                                   </li>
                                 ))}
                               </ul>
@@ -1073,10 +1096,10 @@ const AskPage = () => {
                             />
                           </div>
 
-                          {item.note && (
+                          {(item.note || item.fallbackReason) && (
                             <div className="flex items-center space-x-2 p-2.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-200 text-xs">
                               <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-500" />
-                              <span>{item.note}</span>
+                              <span>{FALLBACK_MESSAGES[item.fallbackReason] || item.note}</span>
                             </div>
                           )}
 
@@ -1395,21 +1418,33 @@ const AskPage = () => {
               {/* Mode Selector & Context Controls */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="space-y-1">
-                  <label className="text-[11px] font-semibold text-slate-700 dark:text-slate-300 flex items-center space-x-1">
-                    <Sparkles className="w-3 h-3 text-brand-500" />
-                    <span>Response Mode:</span>
-                  </label>
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] font-semibold text-slate-700 dark:text-slate-300 flex items-center space-x-1">
+                      <Sparkles className="w-3 h-3 text-brand-500" />
+                      <span>Response Mode:</span>
+                    </label>
+                    {selectedMode === 'image' && (
+                      <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300">
+                        Images today: {capabilities?.imagesUsedToday ?? 0} / {capabilities?.imageDailyLimit ?? 5}
+                      </span>
+                    )}
+                  </div>
                   <select
                     value={selectedMode}
                     onChange={(e) => handleModeChange(e.target.value)}
                     disabled={loading}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-brand-500 cursor-pointer"
                   >
-                    {MODES.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.name} — {m.description}
-                      </option>
-                    ))}
+                    {MODES.map((m) => {
+                      const imageUsageText = m.id === 'image'
+                        ? ` (Images today: ${capabilities?.imagesUsedToday ?? 0} / ${capabilities?.imageDailyLimit ?? 5})`
+                        : '';
+                      return (
+                        <option key={m.id} value={m.id}>
+                          {m.name}{imageUsageText} — {m.description}
+                        </option>
+                      );
+                    })}
                   </select>
                   {selectedMode === 'image' && (
                     <p className="text-[11px] text-amber-600 dark:text-amber-400 font-medium flex items-center space-x-1 mt-1">

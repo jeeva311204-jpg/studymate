@@ -352,14 +352,16 @@ exports.askQuestion = async (req, res) => {
     }
 
     // Helper for falling back to SVG diagram
-    const handleSvgFallback = async (q, userReq, userRes, fallbackDate, conv, origMode, note = '') => {
-      try {
-        await AskUsage.findOneAndUpdate(
-          { user: userReq.user._id, date: fallbackDate, count: { $lt: DAILY_ASK_LIMIT } },
-          { $inc: { count: 1 } },
-          { upsert: true }
-        );
-      } catch (_) {}
+    const handleSvgFallback = async (q, userReq, userRes, fallbackDate, conv, origMode, note = '', fallbackReason = null) => {
+      if (fallbackReason !== 'user_cap' && fallbackReason !== 'global_cap') {
+        try {
+          await AskUsage.findOneAndUpdate(
+            { user: userReq.user._id, date: fallbackDate, count: { $lt: DAILY_ASK_LIMIT } },
+            { $inc: { count: 1 } },
+            { upsert: true }
+          );
+        } catch (_) {}
+      }
 
       const svgFallbackPrompt = `You are StudyMate AI, an expert academic tutor and study assistant.
 Format requirements: You must generate a diagram for the student as a single valid, self-contained SVG, plus a one-line description in a separate field.
@@ -435,6 +437,7 @@ Diagram for ${q.slice(0, 40)}
         mode: 'svg',
         hasImage: false,
         note: note || null,
+        fallbackReason: fallbackReason || null,
         createdAt: new Date(),
       };
 
@@ -462,6 +465,7 @@ Diagram for ${q.slice(0, 40)}
         mode: 'svg',
         resolvedMode: 'svg',
         fallback: true,
+        fallbackReason: fallbackReason || null,
         conversationId: savedId,
       };
       if (note) {
@@ -535,7 +539,7 @@ Diagram for ${q.slice(0, 40)}
       if (provider === 'none') {
         if (shouldFallback) {
           today = getKolkataDateString();
-          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, 'Image service is busy, here is a diagram instead.');
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, 'Image service is busy, here is a diagram instead.', 'provider_error');
         }
         return res.status(503).json({
           error: true,
@@ -568,7 +572,8 @@ Diagram for ${q.slice(0, 40)}
 
       if (!reservedGlobal) {
         if (shouldFallback) {
-          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, 'Image service is busy, here is a diagram instead.');
+          const fallbackNote = 'Image generation is paused for today because the free daily limit was reached. Here is a diagram instead.';
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, fallbackNote, 'global_cap');
         }
         return res.status(429).json({
           error: true,
@@ -611,7 +616,8 @@ Diagram for ${q.slice(0, 40)}
         await GlobalImageUsage.updateOne({ date: today }, { $inc: { count: -1 } }).catch(() => {});
 
         if (shouldFallback) {
-          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, 'Image service is busy, here is a diagram instead.');
+          const fallbackNote = "You've used all 5 image generations for today. They reset at midnight (IST). Here is a diagram instead.";
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, fallbackNote, 'user_cap');
         }
 
         const usage = await AskUsage.findOne({ user: req.user._id, date: today });
@@ -649,7 +655,7 @@ Diagram for ${q.slice(0, 40)}
 
         if (shouldFallback) {
           const fallbackNote = 'Image service is busy, here is a diagram instead.';
-          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, fallbackNote);
+          return await handleSvgFallback(trimmedQuestion, req, res, today, existingConversation, mode, fallbackNote, 'provider_error');
         }
 
         const statusCode = imgErr.status || 503;
@@ -1277,9 +1283,21 @@ exports.deleteConversation = async (req, res) => {
 exports.getCapabilities = async (req, res) => {
   const provider = getImageProvider();
   const imageGeneration = provider !== 'none';
+  const today = getKolkataDateString();
+  let imagesUsedToday = 0;
+
+  if (req.user && req.user._id) {
+    const usage = await AskUsage.findOne({ user: req.user._id, date: today });
+    if (usage && typeof usage.imageCount === 'number') {
+      imagesUsedToday = usage.imageCount;
+    }
+  }
+
   return res.status(200).json({
     imageGeneration,
     provider,
+    imagesUsedToday,
+    imageDailyLimit: DAILY_IMAGE_LIMIT,
   });
 };
 
@@ -1288,6 +1306,7 @@ exports.detectImageMimeType = detectImageMimeType;
 exports.isImageGenerationRequest = isImageGenerationRequest;
 exports.isSvgDiagramRequest = isSvgDiagramRequest;
 exports.getImageProvider = getImageProvider;
+exports.DAILY_IMAGE_LIMIT = DAILY_IMAGE_LIMIT;
 exports.MAX_STORED_SVG_BYTES = MAX_STORED_SVG_BYTES;
 exports.stripTextAndLabelRequests = stripTextAndLabelRequests;
 exports.NO_TEXT_INSTRUCTION = NO_TEXT_INSTRUCTION;

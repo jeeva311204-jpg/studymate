@@ -12,21 +12,20 @@ class ImageGenError extends Error {
   }
 }
 
-const NO_TEXT_INSTRUCTION = 'Clean illustration, no text, no letters, no words, no labels, no captions, no watermark.';
+const NO_TEXT_INSTRUCTION = '';
 
 /**
- * Strips any requests to "label" or "add text" from user prompt for image providers
+ * Strips any requests to "label", "caption", or "text" from user prompt for image providers
  */
 const stripTextAndLabelRequests = (text) => {
   if (!text || typeof text !== 'string') return '';
-  const hasInstruction = text.includes(NO_TEXT_INSTRUCTION);
-  let cleaned = hasInstruction ? text.replace(NO_TEXT_INSTRUCTION, '').trim() : text;
 
-  return cleaned
-    .replace(/\b(?:please\s+)?(?:add|include|with)\s+(?:text(?:\s+labels?)?|labels?)\b/gi, '')
-    .replace(/\b(?:and\s+)?(?:label|add\s+text)(?:\s+(?:it|them|the\s+parts|all\s+parts|parts|everything))?\b/gi, '')
-    .replace(/\b(?:labelled|labeled|labelling|labeling)\b/gi, '')
-    .replace(/\b(?:labels?|add\s+text)\b/gi, '')
+  return text
+    .replace(/\b(?:please\s+)?(?:add|include|with)\s+(?:text(?:\s+labels?)?|labels?|captions?|words?|letters?|watermarks?)\b/gi, '')
+    .replace(/\b(?:and\s+)?(?:label|add\s+text|add\s+captions?|add\s+labels?)(?:\s+(?:it|them|the\s+parts|all\s+parts|parts|everything))?\b/gi, '')
+    .replace(/\b(?:labelled|labeled|labelling|labeling|captioned)\b/gi, '')
+    .replace(/\b(?:labels?|captions?|add\s+text|watermarks?)\b/gi, '')
+    .replace(/\b(?:text|words?|letters?)\b/gi, '')
     .replace(/\b(?:and|with|please)\s*$/gi, '')
     .replace(/,\s*,/g, ',')
     .replace(/,\s*$/g, '')
@@ -36,11 +35,11 @@ const stripTextAndLabelRequests = (text) => {
 };
 
 /**
- * Wraps user input into an educational illustration prompt
+ * Wraps user input into a positive educational illustration prompt
  */
 const buildEducationalPrompt = (studentPrompt) => {
   const cleaned = stripTextAndLabelRequests(studentPrompt);
-  return `Create a clean educational illustration to explain the following concept: "${cleaned}". Requirements: Clear visual explanation, no real people, strictly safe educational content. ${NO_TEXT_INSTRUCTION}`;
+  return `Simple clean educational illustration of ${cleaned}, plain pale background, single centred object, flat colours, no extra decoration.`;
 };
 
 /**
