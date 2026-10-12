@@ -4253,6 +4253,20 @@ Diagram of mitochondria
         else delete process.env.IMAGE_PROVIDER;
       }
     });
+
+    it('9.35 client regenerate and Ask AI requests use base-relative paths without "/api/" prefix', async () => {
+      const fs = require('fs');
+      const path = require('path');
+      const askPagePath = path.resolve(__dirname, '../../../client/src/pages/AskPage.jsx');
+      const content = fs.readFileSync(askPagePath, 'utf8');
+
+      // Verify no api.<method>('/api/...') calls exist in AskPage.jsx
+      assert.ok(!content.includes("api.post('/api/"), 'AskPage.jsx must not have api.post starting with "/api/"');
+      assert.ok(!content.includes('api.post("/api/'), 'AskPage.jsx must not have api.post starting with "/api/"');
+      assert.ok(!content.includes("api.get('/api/"), 'AskPage.jsx must not have api.get starting with "/api/"');
+      assert.ok(!content.includes('api.get("/api/'), 'AskPage.jsx must not have api.get starting with "/api/"');
+      assert.ok(content.includes("api.post('/ask', {"), 'AskPage.jsx regenerate call must use base-relative path "/ask"');
+    });
   });
 });
 

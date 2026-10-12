@@ -620,7 +620,7 @@ const AskPage = () => {
     setRegeneratingMsgId(msgId);
     setError(null);
     try {
-      const res = await api.post('/api/ask', {
+      const res = await api.post('/ask', {
         regenerate: {
           conversationId: activeConversationId,
           messageId: msgId,
